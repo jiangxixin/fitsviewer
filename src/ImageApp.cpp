@@ -1,12 +1,14 @@
 #include "ImageApp.h"
 #include "Debayer.h"
-#include "Stretch.h"   // 用 tone_curve 画曲线 & 导出
+#include "Stretch.h"
 #include "FitsImage.h"
+#include "EmbeddedFont.h"
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <misc/cpp/imgui_stdlib.h>
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_opengl3.h>
@@ -29,6 +31,70 @@ static inline float clamp01(float v)
     if (v > 1.0f) return 1.0f;
     return v;
 }
+
+// ===== App 自定义配置，写入 imgui.ini =====
+struct AppSettings
+{
+    std::string lastDir;
+    int  bayerPattern   = 1;   // 默认 RGGB
+    int  stretchMode    = 1;   // 默认 Arcsinh
+    float wbR           = 1.0f;
+    float wbG           = 1.0f;
+    float wbB           = 1.0f;
+};
+
+static AppSettings g_AppSettings;
+
+static void AppSettings_ClearAll(ImGuiContext*, ImGuiSettingsHandler*)
+{
+    g_AppSettings = AppSettings{};
+}
+
+static void* AppSettings_ReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char* name)
+{
+    if (strcmp(name, "Main") == 0)
+        return &g_AppSettings;
+    return nullptr;
+}
+
+static void AppSettings_ReadLine(ImGuiContext*, ImGuiSettingsHandler*, void*, const char* line)
+{
+    if (strncmp(line, "LastDir=", 8) == 0)
+    {
+        g_AppSettings.lastDir = line + 8;
+    }
+    else if (sscanf(line, "Bayer=%d", &g_AppSettings.bayerPattern) == 1)
+    {
+    }
+    else if (sscanf(line, "StretchMode=%d", &g_AppSettings.stretchMode) == 1)
+    {
+    }
+    else if (sscanf(line, "WBR=%f", &g_AppSettings.wbR) == 1)
+    {
+    }
+    else if (sscanf(line, "WBG=%f", &g_AppSettings.wbG) == 1)
+    {
+    }
+    else if (sscanf(line, "WBB=%f", &g_AppSettings.wbB) == 1)
+    {
+    }
+}
+
+static void AppSettings_WriteAll(ImGuiContext* ctx, ImGuiSettingsHandler* handler, ImGuiTextBuffer* out_buf)
+{
+    (void)ctx;
+    out_buf->appendf("[%s][Main]\n", handler->TypeName);
+    if (!g_AppSettings.lastDir.empty())
+        out_buf->appendf("LastDir=%s\n", g_AppSettings.lastDir.c_str());
+
+    out_buf->appendf("Bayer=%d\n", g_AppSettings.bayerPattern);
+    out_buf->appendf("StretchMode=%d\n", g_AppSettings.stretchMode);
+    out_buf->appendf("WBR=%f\n", g_AppSettings.wbR);
+    out_buf->appendf("WBG=%f\n", g_AppSettings.wbG);
+    out_buf->appendf("WBB=%f\n", g_AppSettings.wbB);
+    out_buf->append("\n");
+}
+// ===== App 自定义配置结束 =====
 
 ImageApp::ImageApp() {}
 ImageApp::~ImageApp()
@@ -72,18 +138,74 @@ bool ImageApp::init()
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
 
+    // 注册 SettingsHandler
+    {
+        ImGuiSettingsHandler handler;
+        handler.TypeName = "App";
+        handler.TypeHash = ImHashStr("App");
+        handler.ClearAllFn = AppSettings_ClearAll;
+        handler.ReadInitFn = nullptr;
+        handler.ReadOpenFn = AppSettings_ReadOpen;
+        handler.ReadLineFn = AppSettings_ReadLine;
+        handler.ApplyAllFn = nullptr;
+        handler.WriteAllFn = AppSettings_WriteAll;
+        ImGui::GetCurrentContext()->SettingsHandlers.push_back(handler);
+    }
+
+    // 加载内嵌中文字体
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        io.Fonts->Clear();
+
+        ImFont* mainFont = nullptr;
+
+        if (g_NotoSansSC_compressed_size > 0)
+        {
+            ImFontConfig cfg;
+            cfg.SizePixels = 13.0f;
+
+            const ImWchar* ranges = io.Fonts->GetGlyphRangesChineseFull();
+
+            mainFont = io.Fonts->AddFontFromMemoryCompressedTTF(
+                (void*)g_NotoSansSC_compressed_data,
+                g_NotoSansSC_compressed_size,
+                13.0f,
+                &cfg,
+                ranges
+            );
+        }
+
+        if (!mainFont)
+        {
+            std::cerr << "WARNING: embedded font not loaded, using default.\n";
+            mainFont = io.Fonts->AddFontDefault();
+        }
+
+        io.FontDefault = mainFont;
+    }
+
     ImGui_ImplGlfw_InitForOpenGL(_window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
+    // 初始化 lastDir / Bayer / Stretch / WB
     try
     {
-        _fileDialogDir = fs::current_path().string();
+        if (!g_AppSettings.lastDir.empty() && fs::exists(g_AppSettings.lastDir))
+            _fileDialogDir = g_AppSettings.lastDir;
+        else
+            _fileDialogDir = fs::current_path().string();
     }
     catch (...)
     {
         _fileDialogDir = ".";
     }
     _fileListDirty = true;
+
+    _bayerHint   = static_cast<BayerPattern>(g_AppSettings.bayerPattern);
+    _stretchMode = g_AppSettings.stretchMode;
+    _wbR         = g_AppSettings.wbR;
+    _wbG         = g_AppSettings.wbG;
+    _wbB         = g_AppSettings.wbB;
 
     return true;
 }
@@ -129,21 +251,10 @@ void ImageApp::main_loop()
         int display_w, display_h;
         glfwGetFramebufferSize(_window, &display_w, &display_h);
 
-        // ==== 鼠标缩放 / 平移 ====
+        // 用 UI 滑块控制缩放，鼠标右键平移
         ImGuiIO& io = ImGui::GetIO();
-
         if (_hasImage)
         {
-            // 滚轮缩放（macOS 上用两指上下滑动）
-            if (io.MouseWheel != 0.0f)
-            {
-                float zoomFactor = 1.0f + io.MouseWheel * 0.1f; // 每格 ~10%
-                _zoom *= zoomFactor;
-                if (_zoom < 0.1f) _zoom = 0.1f;
-                if (_zoom > 20.0f) _zoom = 20.0f;
-            }
-
-            // 右键拖动平移
             if (ImGui::IsMouseDown(ImGuiMouseButton_Right))
             {
                 float dx = -io.MouseDelta.x / (float)display_w;
@@ -153,17 +264,13 @@ void ImageApp::main_loop()
             }
         }
 
-        // 传给 GPU
         _renderer.setViewParams(_zoom, _panX, _panY);
 
         glViewport(0, 0, display_w, display_h);
         glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        // 先画 GPU 图像
         _renderer.render(display_w, display_h);
-
-        // 再画 ImGui
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(_window);
@@ -195,13 +302,14 @@ void ImageApp::render_ui()
         if (newPattern != _bayerHint)
         {
             _bayerHint = newPattern;
+            g_AppSettings.bayerPattern = currentPattern;
             bayerChanged = true;
         }
     }
 
     ImGui::Separator();
 
-    // === 拉伸模式 ===
+    // 拉伸模式
     const char* stretchModes[] = {
         "Linear",
         "Arcsinh",
@@ -215,9 +323,10 @@ void ImageApp::render_ui()
     if (stretchModeChanged)
     {
         _renderer.setStretchMode(_stretchMode);
+        g_AppSettings.stretchMode = _stretchMode;
     }
 
-    // === Auto stretch 参数 ===
+    // Auto stretch 参数
     bool autoParamsChanged = false;
 
     if (ImGui::Checkbox("Auto Stretch", &_autoStretch))
@@ -232,19 +341,29 @@ void ImageApp::render_ui()
     if (ImGui::SliderFloat("Stretch strength", &_stretchStrength, 1.0f, 20.0f))
         if (ImGui::IsItemEdited()) autoParamsChanged = true;
 
-    // 拉伸模式改变时，也认为 auto 参数变了（导出时会用）
     if (stretchModeChanged)
         autoParamsChanged = true;
 
     if (autoParamsChanged && _hasImage)
     {
-        recompute_auto_params();
+        float low = 0.0f, high = 1.0f;
+        if (_renderer.computeAutoParamsGpu(_autoStretch, _blackClip, _whiteClip, low, high))
+        {
+            _autoLow  = low;
+            _autoHigh = high;
+        }
+        else
+        {
+            _autoLow  = 0.0f;
+            _autoHigh = 1.0f;
+        }
+
         _renderer.setAutoParams(_autoStretch, _autoLow, _autoHigh, _stretchStrength);
     }
 
     ImGui::Separator();
 
-    // === 手动曲线 ===
+    // 手动曲线
     bool curveChanged = false;
 
     if (ImGui::Checkbox("Use manual curve", &_useManualCurve))
@@ -259,7 +378,6 @@ void ImageApp::render_ui()
     if (ImGui::SliderFloat("Curve gamma", &_curveGamma, 0.1f, 5.0f))
         if (ImGui::IsItemEdited()) curveChanged = true;
 
-    // 曲线预览
     {
         const int N = 256;
         static float curve[N];
@@ -276,7 +394,26 @@ void ImageApp::render_ui()
 
     ImGui::Separator();
 
-    // === 白平衡 ===
+    // 视图 Scale 滑块
+    {
+        float zoomMin = 0.1f, zoomMax = 20.0f;
+        if (ImGui::SliderFloat("Scale", &_zoom, zoomMin, zoomMax, "%.2f", ImGuiSliderFlags_Logarithmic))
+        {
+            if (_zoom < zoomMin) _zoom = zoomMin;
+            if (_zoom > zoomMax) _zoom = zoomMax;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset View"))
+        {
+            _zoom = 1.0f;
+            _panX = 0.0f;
+            _panY = 0.0f;
+        }
+    }
+
+    ImGui::Separator();
+
+    // 白平衡
     bool wbChanged = false;
 
     if (ImGui::SliderFloat("R gain", &_wbR, 0.1f, 4.0f))
@@ -287,22 +424,35 @@ void ImageApp::render_ui()
         wbChanged = true;
 
     if (wbChanged)
+    {
         _renderer.setWhiteBalance(_wbR, _wbG, _wbB);
+        g_AppSettings.wbR = _wbR;
+        g_AppSettings.wbG = _wbG;
+        g_AppSettings.wbB = _wbB;
+    }
 
     ImGui::Separator();
     if (ImGui::Button("Export PNG"))
     {
         if (_hasImage)
-            export_png("output.png");
+            export_png("output.png");   // 形参现在已被忽略，但保留调用
+    }
+
+    // 导出成功提示
+    if (_exportJustSucceeded && !_lastExportPath.empty())
+    {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f),
+                           "导出成功: %s", _lastExportPath.c_str());
     }
 
     ImGui::End();
 
+
     if (_showFileDialog)
         render_file_dialog();
 
-    // === 拜耳切换后，自动重新加载当前文件 ===
-    if (bayerChanged && !_currentPath.empty())
+    if (bayerChanged)
     {
         _renderer.setBayerPattern(static_cast<int>(_bayerHint));
     }
@@ -323,7 +473,10 @@ void ImageApp::open_file_dialog()
         }
         else
         {
-            _fileDialogDir = fs::current_path().string();
+            if (!g_AppSettings.lastDir.empty() && fs::exists(g_AppSettings.lastDir))
+                _fileDialogDir = g_AppSettings.lastDir;
+            else
+                _fileDialogDir = fs::current_path().string();
         }
     }
     catch (...)
@@ -356,6 +509,11 @@ void ImageApp::render_file_dialog()
 {
     if (!_showFileDialog) return;
     if (_fileListDirty)  refresh_file_list();
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.7f, io.DisplaySize.y * 0.7f),
+                             ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(600, 400), ImVec2(FLT_MAX, FLT_MAX));
 
     ImGui::Begin("Open FITS", &_showFileDialog);
 
@@ -422,10 +580,23 @@ void ImageApp::render_file_dialog()
     ImGui::End();
 }
 
-// ---------- 图像 & 拉伸 ----------
+// ---------- 图像加载 ----------
 
 void ImageApp::load_fits_file(const std::string& path)
 {
+    // 更新 lastDir
+    try
+    {
+        fs::path p(path);
+        if (fs::exists(p))
+        {
+            fs::path dir = p.has_parent_path() ? p.parent_path() : fs::current_path();
+            _fileDialogDir = dir.string();
+            g_AppSettings.lastDir = _fileDialogDir;
+        }
+    }
+    catch (...) {}
+
     FitsImage img;
     if (!load_fits(path, img, _bayerHint))
     {
@@ -434,60 +605,15 @@ void ImageApp::load_fits_file(const std::string& path)
     }
 
     _fits = img;
+    _imgWidth  = _fits.width;
+    _imgHeight = _fits.height;
+    _hasImage  = !_fits.raw.empty();
 
-    // === 1. CPU 去拜耳：用于亮度统计 & 导出 PNG ===
-    FitsImage debayered;
-    if (!debayer_bilinear(_fits, debayered))
-    {
-        // 灰度兜底
-        debayered = _fits;
-        debayered.channels = 3;
-        debayered.bayer = BayerPattern::NONE;
-        debayered.rgb.resize(static_cast<size_t>(debayered.width) * debayered.height * 3);
-
-        double mn = 0.0, mx = 1.0;
-        if (!_fits.raw.empty())
-        {
-            auto [itMin, itMax] = std::minmax_element(_fits.raw.begin(), _fits.raw.end());
-            mn = *itMin;
-            mx = *itMax;
-            if (mn == mx)
-            {
-                mn = 0.0;
-                mx = 1.0;
-            }
-        }
-        double range = mx - mn;
-
-        for (int y = 0; y < debayered.height; ++y)
-        {
-            for (int x = 0; x < debayered.width; ++x)
-            {
-                size_t idx = static_cast<size_t>(y) * debayered.width + x;
-                float v = static_cast<float>((_fits.raw[idx] - mn) / range);
-                v = clamp01(v);
-                debayered.rgb[idx * 3 + 0] = v;
-                debayered.rgb[idx * 3 + 1] = v;
-                debayered.rgb[idx * 3 + 2] = v;
-            }
-        }
-    }
-
-    _linearRgb = debayered.rgb;
-    _imgWidth  = debayered.width;
-    _imgHeight = debayered.height;
-    _hasImage  = !_linearRgb.empty();
-
-    // 重置视图状态
     _zoom = 1.0f;
     _panX = 0.0f;
     _panY = 0.0f;
 
-    // === 2. 亮度统计 & auto stretch 参数 ===
-    build_luminance_stats();
-    recompute_auto_params();
-
-    // === 3. 构造 Bayer 归一化数据，上传给 GPU 去拜耳 ===
+    // 归一化 RAW 到 [0,1]，上传给 GPU
     std::vector<float> bayerNorm;
     bayerNorm.resize(_fits.raw.size());
 
@@ -512,214 +638,75 @@ void ImageApp::load_fits_file(const std::string& path)
 
     _renderer.uploadBaseTexture(bayerNorm, _fits.width, _fits.height);
     _renderer.setBayerPattern(static_cast<int>(_bayerHint));
-    _renderer.setAutoParams(_autoStretch, _autoLow, _autoHigh, _stretchStrength);
-    _renderer.setCurveParams(_useManualCurve, _curveBlack, _curveWhite, _curveGamma);
-    _renderer.setStretchMode(_stretchMode);
     _renderer.setWhiteBalance(_wbR, _wbG, _wbB);
-}
+    _renderer.setStretchMode(_stretchMode);
 
-void ImageApp::build_luminance_stats()
-{
-    _lum.clear();
-    _lumSorted.clear();
-    _medianLum = 0.0f;
-    _madLum    = 0.0f;
-
-    if (_linearRgb.empty())
-        return;
-
-    size_t pixels = _linearRgb.size() / 3;
-    _lum.resize(pixels);
-
-    for (size_t i = 0; i < pixels; ++i)
+    // GPU 统计 auto stretch 参数
+    float low = 0.0f, high = 1.0f;
+    if (_renderer.computeAutoParamsGpu(_autoStretch, _blackClip, _whiteClip, low, high))
     {
-        float r = _linearRgb[i * 3 + 0];
-        float g = _linearRgb[i * 3 + 1];
-        float b = _linearRgb[i * 3 + 2];
-        float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-        _lum[i] = clamp01(l);
+        _autoLow  = low;
+        _autoHigh = high;
     }
-
-    _lumSorted = _lum;
-    std::sort(_lumSorted.begin(), _lumSorted.end());
-
-    size_t n = _lumSorted.size();
-    if (n == 0)
-        return;
-
-    size_t mid = n / 2;
-    if (n % 2 == 0)
-        _medianLum = 0.5f * (_lumSorted[mid - 1] + _lumSorted[mid]);
     else
-        _medianLum = _lumSorted[mid];
-
-    std::vector<float> devs(n);
-    for (size_t i = 0; i < n; ++i)
-        devs[i] = std::fabs(_lum[i] - _medianLum);
-    std::sort(devs.begin(), devs.end());
-    if (n % 2 == 0)
-        _madLum = 0.5f * (devs[mid - 1] + devs[mid]);
-    else
-        _madLum = devs[mid];
-
-    if (_madLum < 1e-6f)
-        _madLum = 1e-6f;
-}
-
-void ImageApp::recompute_auto_params()
-{
-    if (!_autoStretch || _lumSorted.empty())
     {
         _autoLow  = 0.0f;
         _autoHigh = 1.0f;
-        return;
     }
 
-    size_t n = _lumSorted.size();
-    if (n == 0)
-        return;
-
-    auto clampPercent = [](float v) {
-        if (v < 0.0f) return 0.0f;
-        if (v > 100.0f) return 100.0f;
-        return v;
-    };
-
-    float bc = clampPercent(_blackClip);
-    float wc = clampPercent(_whiteClip);
-
-    float pLow  = bc / 100.0f;
-    float pHigh = (100.0f - wc) / 100.0f;
-
-    size_t idxLow  = static_cast<size_t>(pLow  * (n - 1));
-    size_t idxHigh = static_cast<size_t>(pHigh * (n - 1));
-    if (idxLow >= n) idxLow = n - 1;
-    if (idxHigh >= n) idxHigh = n - 1;
-    if (idxLow > idxHigh) idxLow = 0;
-
-    float lowP  = _lumSorted[idxLow];
-    float highP = _lumSorted[idxHigh];
-
-    const float kSigma = 1.5f;
-    float candidateLow = clamp01(_medianLum - kSigma * _madLum);
-
-    float low  = std::max(candidateLow, lowP);
-    float high = std::max(highP, low + 1e-3f);
-
-    if (high <= low + 1e-4f)
-    {
-        low  = lowP;
-        high = std::max(highP, low + 1e-3f);
-    }
-
-    _autoLow  = low;
-    _autoHigh = high;
+    _renderer.setAutoParams(_autoStretch, _autoLow, _autoHigh, _stretchStrength);
 }
 
-// ---------- 导出 PNG：CPU 模拟 shader ----------
+// ---------- 导出 PNG：完全用 GPU 渲染 ----------
 
-void ImageApp::compute_processed_cpu(std::vector<float>& outRgb)
+void ImageApp::export_png(const std::string& /*path_unused*/)
 {
-    outRgb.clear();
-    if (!_hasImage || _linearRgb.empty())
+    if (!_hasImage || _imgWidth <= 0 || _imgHeight <= 0)
         return;
 
-    outRgb.resize(_linearRgb.size());
+    // 1. 基于当前 FITS 路径生成导出 PNG 文件名
+    fs::path inPath(_currentPath);
+    fs::path outPath;
 
-    float low  = _autoLow;
-    float high = _autoHigh;
-    float range = std::max(high - low, 1e-3f);
-
-    float s = std::max(_stretchStrength, 1.0f);
-    float denom = std::asinh(s);
-    if (denom < 1e-6f) denom = 1e-6f;
-
-    for (size_t i = 0; i < _linearRgb.size(); i += 3)
+    if (!inPath.empty())
     {
-        float r = _linearRgb[i + 0];
-        float g = _linearRgb[i + 1];
-        float b = _linearRgb[i + 2];
-
-        // 白平衡
-        r *= _wbR;
-        g *= _wbG;
-        b *= _wbB;
-        r = clamp01(r);
-        g = clamp01(g);
-        b = clamp01(b);
-
-        if (_autoStretch)
-        {
-            r = (r - low) / range;
-            g = (g - low) / range;
-            b = (b - low) / range;
-
-            r = clamp01(r);
-            g = clamp01(g);
-            b = clamp01(b);
-
-            if (_stretchMode == 0)
-            {
-                // Linear
-            }
-            else if (_stretchMode == 1)
-            {
-                // asinh
-                r = std::asinh(s * r) / denom;
-                g = std::asinh(s * g) / denom;
-                b = std::asinh(s * b) / denom;
-            }
-            else if (_stretchMode == 2)
-            {
-                // log
-                float k = s;
-                float dlog = std::log(1.0f + k);
-                r = std::log(1.0f + k * r) / dlog;
-                g = std::log(1.0f + k * g) / dlog;
-                b = std::log(1.0f + k * b) / dlog;
-            }
-            else if (_stretchMode == 3)
-            {
-                // sqrt
-                r = std::sqrt(r);
-                g = std::sqrt(g);
-                b = std::sqrt(b);
-            }
-
-            r = clamp01(r);
-            g = clamp01(g);
-            b = clamp01(b);
-        }
-
-        if (_useManualCurve)
-        {
-            r = tone_curve(r, _curveBlack, _curveWhite, _curveGamma);
-            g = tone_curve(g, _curveBlack, _curveWhite, _curveGamma);
-            b = tone_curve(b, _curveBlack, _curveWhite, _curveGamma);
-        }
-
-        outRgb[i + 0] = r;
-        outRgb[i + 1] = g;
-        outRgb[i + 2] = b;
+        // 如果有原文件，就用同目录 + 同名改后缀
+        outPath = inPath;
+        outPath.replace_extension(".png");
     }
-}
-
-void ImageApp::export_png(const std::string& path)
-{
-    if (!_hasImage)
-        return;
-
-    std::vector<float> rgb;
-    compute_processed_cpu(rgb);
-    if (rgb.empty())
-        return;
-
-    std::vector<unsigned char> u8 = rgb_to_u8(rgb, _imgWidth, _imgHeight);
-
-    int stride = _imgWidth * 3;
-    if (!stbi_write_png(path.c_str(), _imgWidth, _imgHeight, 3,
-                        u8.data(), stride))
-        std::cerr << "Failed to write png: " << path << "\n";
     else
-        std::cout << "PNG saved to " << path << "\n";
+    {
+        // 如果当前路径是空的，退回当前工作目录下的 default.png
+        outPath = fs::current_path() / "output.png";
+    }
+
+    // 2. 确保 GPU 使用当前视图参数（缩放 / 平移）
+    _renderer.setViewParams(_zoom, _panX, _panY);
+
+    // 3. 让 GPU 渲染全分辨率图像，并读回 RGB8
+    std::vector<unsigned char> rgb;
+    if (!_renderer.renderToImage(_imgWidth, _imgHeight, rgb))
+    {
+        std::cerr << "Failed to render image for export\n";
+        _exportJustSucceeded = false;
+        return;
+    }
+
+    // 4. 写 PNG
+    int stride = _imgWidth * 3;
+    std::string outStr = outPath.string();
+
+    if (!stbi_write_png(outStr.c_str(), _imgWidth, _imgHeight, 3,
+                        rgb.data(), stride))
+    {
+        std::cerr << "Failed to write png: " << outStr << "\n";
+        _exportJustSucceeded = false;
+    }
+    else
+    {
+        _lastExportPath = outStr;
+        _exportJustSucceeded = true;
+        std::cout << "PNG saved to " << _lastExportPath << "\n";
+    }
 }
+

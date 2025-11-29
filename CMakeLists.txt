@@ -77,6 +77,7 @@ add_executable(FitsViewer
     src/Stretch.cpp
     src/ImageApp.cpp
     src/GlImageRenderer.cpp
+    src/EmbeddedFont.cpp
     ${IMGUI_SOURCES}
     ${GLAD_SOURCES}
 )
