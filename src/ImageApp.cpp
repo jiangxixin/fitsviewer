@@ -1,6 +1,6 @@
 #include "ImageApp.h"
 #include "Debayer.h"
-#include "Stretch.h"   // 用 tone_curve 画曲线
+#include "Stretch.h"   // 用 tone_curve 画曲线 & 导出
 #include "FitsImage.h"
 
 #include <glad/glad.h>
@@ -129,6 +129,33 @@ void ImageApp::main_loop()
         int display_w, display_h;
         glfwGetFramebufferSize(_window, &display_w, &display_h);
 
+        // ==== 鼠标缩放 / 平移 ====
+        ImGuiIO& io = ImGui::GetIO();
+
+        if (_hasImage)
+        {
+            // 滚轮缩放（macOS 上用两指上下滑动）
+            if (io.MouseWheel != 0.0f)
+            {
+                float zoomFactor = 1.0f + io.MouseWheel * 0.1f; // 每格 ~10%
+                _zoom *= zoomFactor;
+                if (_zoom < 0.1f) _zoom = 0.1f;
+                if (_zoom > 20.0f) _zoom = 20.0f;
+            }
+
+            // 右键拖动平移
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Right))
+            {
+                float dx = -io.MouseDelta.x / (float)display_w;
+                float dy =  io.MouseDelta.y / (float)display_h;
+                _panX += dx * _zoom;
+                _panY += dy * _zoom;
+            }
+        }
+
+        // 传给 GPU
+        _renderer.setViewParams(_zoom, _panX, _panY);
+
         glViewport(0, 0, display_w, display_h);
         glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -158,13 +185,39 @@ void ImageApp::render_ui()
             load_fits_file(_currentPath);
     }
 
+    // Bayer 选择
     const char* patterns[] = {"None", "RGGB", "BGGR", "GRBG", "GBRG"};
     int currentPattern = static_cast<int>(_bayerHint);
+    bool bayerChanged = false;
     if (ImGui::Combo("Bayer", &currentPattern, patterns, IM_ARRAYSIZE(patterns)))
-        _bayerHint = static_cast<BayerPattern>(currentPattern);
+    {
+        BayerPattern newPattern = static_cast<BayerPattern>(currentPattern);
+        if (newPattern != _bayerHint)
+        {
+            _bayerHint = newPattern;
+            bayerChanged = true;
+        }
+    }
 
     ImGui::Separator();
 
+    // === 拉伸模式 ===
+    const char* stretchModes[] = {
+        "Linear",
+        "Arcsinh",
+        "Log",
+        "Sqrt"
+    };
+    bool stretchModeChanged = ImGui::Combo("Stretch mode",
+                                           &_stretchMode,
+                                           stretchModes,
+                                           IM_ARRAYSIZE(stretchModes));
+    if (stretchModeChanged)
+    {
+        _renderer.setStretchMode(_stretchMode);
+    }
+
+    // === Auto stretch 参数 ===
     bool autoParamsChanged = false;
 
     if (ImGui::Checkbox("Auto Stretch", &_autoStretch))
@@ -179,6 +232,10 @@ void ImageApp::render_ui()
     if (ImGui::SliderFloat("Stretch strength", &_stretchStrength, 1.0f, 20.0f))
         if (ImGui::IsItemEdited()) autoParamsChanged = true;
 
+    // 拉伸模式改变时，也认为 auto 参数变了（导出时会用）
+    if (stretchModeChanged)
+        autoParamsChanged = true;
+
     if (autoParamsChanged && _hasImage)
     {
         recompute_auto_params();
@@ -187,6 +244,7 @@ void ImageApp::render_ui()
 
     ImGui::Separator();
 
+    // === 手动曲线 ===
     bool curveChanged = false;
 
     if (ImGui::Checkbox("Use manual curve", &_useManualCurve))
@@ -201,7 +259,7 @@ void ImageApp::render_ui()
     if (ImGui::SliderFloat("Curve gamma", &_curveGamma, 0.1f, 5.0f))
         if (ImGui::IsItemEdited()) curveChanged = true;
 
-    // 曲线预览（CPU 上）
+    // 曲线预览
     {
         const int N = 256;
         static float curve[N];
@@ -217,6 +275,21 @@ void ImageApp::render_ui()
         _renderer.setCurveParams(_useManualCurve, _curveBlack, _curveWhite, _curveGamma);
 
     ImGui::Separator();
+
+    // === 白平衡 ===
+    bool wbChanged = false;
+
+    if (ImGui::SliderFloat("R gain", &_wbR, 0.1f, 4.0f))
+        wbChanged = true;
+    if (ImGui::SliderFloat("G gain", &_wbG, 0.1f, 4.0f))
+        wbChanged = true;
+    if (ImGui::SliderFloat("B gain", &_wbB, 0.1f, 4.0f))
+        wbChanged = true;
+
+    if (wbChanged)
+        _renderer.setWhiteBalance(_wbR, _wbG, _wbB);
+
+    ImGui::Separator();
     if (ImGui::Button("Export PNG"))
     {
         if (_hasImage)
@@ -227,6 +300,12 @@ void ImageApp::render_ui()
 
     if (_showFileDialog)
         render_file_dialog();
+
+    // === 拜耳切换后，自动重新加载当前文件 ===
+    if (bayerChanged && !_currentPath.empty())
+    {
+        _renderer.setBayerPattern(static_cast<int>(_bayerHint));
+    }
 }
 
 // ---------- 文件对话 ----------
@@ -356,6 +435,7 @@ void ImageApp::load_fits_file(const std::string& path)
 
     _fits = img;
 
+    // === 1. CPU 去拜耳：用于亮度统计 & 导出 PNG ===
     FitsImage debayered;
     if (!debayer_bilinear(_fits, debayered))
     {
@@ -398,12 +478,44 @@ void ImageApp::load_fits_file(const std::string& path)
     _imgHeight = debayered.height;
     _hasImage  = !_linearRgb.empty();
 
+    // 重置视图状态
+    _zoom = 1.0f;
+    _panX = 0.0f;
+    _panY = 0.0f;
+
+    // === 2. 亮度统计 & auto stretch 参数 ===
     build_luminance_stats();
     recompute_auto_params();
 
-    _renderer.uploadBaseTexture(_linearRgb, _imgWidth, _imgHeight);
+    // === 3. 构造 Bayer 归一化数据，上传给 GPU 去拜耳 ===
+    std::vector<float> bayerNorm;
+    bayerNorm.resize(_fits.raw.size());
+
+    if (!_fits.raw.empty())
+    {
+        auto [itMin, itMax] = std::minmax_element(_fits.raw.begin(), _fits.raw.end());
+        double mn = *itMin;
+        double mx = *itMax;
+        if (mn == mx)
+        {
+            mn = 0.0;
+            mx = 1.0;
+        }
+        double range = mx - mn;
+
+        for (size_t i = 0; i < _fits.raw.size(); ++i)
+        {
+            float v = static_cast<float>((_fits.raw[i] - mn) / range);
+            bayerNorm[i] = clamp01(v);
+        }
+    }
+
+    _renderer.uploadBaseTexture(bayerNorm, _fits.width, _fits.height);
+    _renderer.setBayerPattern(static_cast<int>(_bayerHint));
     _renderer.setAutoParams(_autoStretch, _autoLow, _autoHigh, _stretchStrength);
     _renderer.setCurveParams(_useManualCurve, _curveBlack, _curveWhite, _curveGamma);
+    _renderer.setStretchMode(_stretchMode);
+    _renderer.setWhiteBalance(_wbR, _wbG, _wbB);
 }
 
 void ImageApp::build_luminance_stats()
@@ -528,6 +640,14 @@ void ImageApp::compute_processed_cpu(std::vector<float>& outRgb)
         float g = _linearRgb[i + 1];
         float b = _linearRgb[i + 2];
 
+        // 白平衡
+        r *= _wbR;
+        g *= _wbG;
+        b *= _wbB;
+        r = clamp01(r);
+        g = clamp01(g);
+        b = clamp01(b);
+
         if (_autoStretch)
         {
             r = (r - low) / range;
@@ -538,9 +658,33 @@ void ImageApp::compute_processed_cpu(std::vector<float>& outRgb)
             g = clamp01(g);
             b = clamp01(b);
 
-            r = std::asinh(s * r) / denom;
-            g = std::asinh(s * g) / denom;
-            b = std::asinh(s * b) / denom;
+            if (_stretchMode == 0)
+            {
+                // Linear
+            }
+            else if (_stretchMode == 1)
+            {
+                // asinh
+                r = std::asinh(s * r) / denom;
+                g = std::asinh(s * g) / denom;
+                b = std::asinh(s * b) / denom;
+            }
+            else if (_stretchMode == 2)
+            {
+                // log
+                float k = s;
+                float dlog = std::log(1.0f + k);
+                r = std::log(1.0f + k * r) / dlog;
+                g = std::log(1.0f + k * g) / dlog;
+                b = std::log(1.0f + k * b) / dlog;
+            }
+            else if (_stretchMode == 3)
+            {
+                // sqrt
+                r = std::sqrt(r);
+                g = std::sqrt(g);
+                b = std::sqrt(b);
+            }
 
             r = clamp01(r);
             g = clamp01(g);
@@ -573,7 +717,8 @@ void ImageApp::export_png(const std::string& path)
     std::vector<unsigned char> u8 = rgb_to_u8(rgb, _imgWidth, _imgHeight);
 
     int stride = _imgWidth * 3;
-    if (!stbi_write_png(path.c_str(), _imgWidth, _imgHeight, 3, u8.data(), stride))
+    if (!stbi_write_png(path.c_str(), _imgWidth, _imgHeight, 3,
+                        u8.data(), stride))
         std::cerr << "Failed to write png: " << path << "\n";
     else
         std::cout << "PNG saved to " << path << "\n";

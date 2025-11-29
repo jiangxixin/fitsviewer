@@ -24,9 +24,9 @@ private:
     void load_fits_file(const std::string& path);
 
     void build_luminance_stats();   // 一次排序
-    void recompute_auto_params();   // 计算 _autoLow/_autoHigh，并同步给 renderer
+    void recompute_auto_params();   // 计算 _autoLow/_autoHigh
 
-    // 导出 PNG 时 CPU 做一次拉伸 + 曲线
+    // 导出 PNG 时 CPU 做一次拉伸 + 曲线 + 白平衡
     void compute_processed_cpu(std::vector<float>& outRgb);
     void export_png(const std::string& path);
 
@@ -38,7 +38,7 @@ private:
 private:
     // 图像数据
     FitsImage _fits;
-    std::vector<float> _linearRgb;
+    std::vector<float> _linearRgb;  // CPU 去拜耳后的 RGB，用于统计 & 导出
     bool _hasImage = false;
 
     // 亮度统计
@@ -65,10 +65,24 @@ private:
     float _stretchStrength  = 5.0f;
     BayerPattern _bayerHint = BayerPattern::RGGB;
 
+    // 拉伸模式：0 线性，1 arcsinh，2 log，3 sqrt
+    int   _stretchMode      = 1;     // 默认 arcsinh
+
+    // 手动曲线
     bool  _useManualCurve   = false;
     float _curveBlack       = 0.0f;
     float _curveWhite       = 1.0f;
     float _curveGamma       = 1.0f;
+
+    // 白平衡 (R/G/B 增益)
+    float _wbR              = 1.0f;
+    float _wbG              = 1.0f;
+    float _wbB              = 1.0f;
+
+    // 视图状态（传给 GPU）
+    float _zoom             = 1.0f;
+    float _panX             = 0.0f;
+    float _panY             = 0.0f;
 
     // 文件对话框
     bool _showFileDialog    = false;

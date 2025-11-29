@@ -125,7 +125,7 @@ void main()
 in vec2 vTexCoord;
 out vec4 FragColor;
 
-uniform sampler2D uBaseTex;
+uniform sampler2D uBaseTex;   // 单通道 Bayer/灰度
 
 uniform float uLow;
 uniform float uHigh;
@@ -137,8 +137,15 @@ uniform float uCurveWhite;
 uniform float uCurveGamma;
 uniform bool  uUseCurve;
 
-uniform vec2 uTexSize;
-uniform vec2 uViewportSize;
+uniform vec2  uTexSize;
+uniform vec2  uViewportSize;
+
+uniform int   uStretchMode;   // 0: linear, 1: asinh, 2: log, 3: sqrt
+uniform float uZoom;
+uniform vec2  uPan;
+
+uniform vec3  uWBGain;        // 白平衡: (R,G,B) 增益
+uniform int   uBayerPattern;  // 0: NONE, 1: RGGB, 2: BGGR, 3: GRBG, 4: GBRG
 
 float clamp01(float x) { return clamp(x, 0.0, 1.0); }
 
@@ -153,9 +160,124 @@ float toneCurve(float x, float black, float white, float gamma)
     return clamp01(y);
 }
 
+// 将概念 RGGB 坐标 (cx,cy) 映射为真实像素坐标
+ivec2 conceptual_to_physical(ivec2 c, ivec2 size, int pattern)
+{
+    int cx = clamp(c.x, 0, size.x - 1);
+    int cy = clamp(c.y, 0, size.y - 1);
+    int px = cx;
+    int py = cy;
+
+    if (pattern == 1) {
+        // RGGB
+    } else if (pattern == 2) {
+        // BGGR = RGGB 旋转 180°
+        px = (size.x - 1) - cx;
+        py = (size.y - 1) - cy;
+    } else if (pattern == 3) {
+        // GRBG = RGGB 水平翻转
+        px = (size.x - 1) - cx;
+        py = cy;
+    } else if (pattern == 4) {
+        // GBRG = RGGB 垂直翻转
+        px = cx;
+        py = (size.y - 1) - cy;
+    }
+
+    px = clamp(px, 0, size.x - 1);
+    py = clamp(py, 0, size.y - 1);
+    return ivec2(px, py);
+}
+
+float sample_raw_bayer(ivec2 c, ivec2 size, int pattern, sampler2D tex)
+{
+    ivec2 p = conceptual_to_physical(c, size, pattern);
+    return texelFetch(tex, p, 0).r;
+}
+
+// 基于 RGGB 概念坐标的双线性去拜耳
+vec3 debayer_bilinear(vec2 uv, sampler2D tex, vec2 texSize, int pattern)
+{
+    ivec2 size = ivec2(int(texSize.x + 0.5), int(texSize.y + 0.5));
+
+    float fx = uv.x * texSize.x;
+    float fy = uv.y * texSize.y;
+    int cx = int(floor(fx + 0.5));
+    int cy = int(floor(fy + 0.5));
+
+    // pattern==0: 当灰度图处理
+    if (pattern == 0)
+    {
+        float v = sample_raw_bayer(ivec2(cx, cy), size, 1, tex); // 用 RGGB 采样即可
+        return vec3(v);
+    }
+
+    bool yEven = (cy & 1) == 0;
+    bool xEven = (cx & 1) == 0;
+
+    float R = 0.0;
+    float G = 0.0;
+    float B = 0.0;
+
+    if (yEven && xEven)
+    {
+        // R 像素
+        R = sample_raw_bayer(ivec2(cx, cy), size, pattern, tex);
+        G = 0.25 * (
+            sample_raw_bayer(ivec2(cx - 1, cy),     size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx + 1, cy),     size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx,     cy - 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx,     cy + 1), size, pattern, tex));
+        B = 0.25 * (
+            sample_raw_bayer(ivec2(cx - 1, cy - 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx + 1, cy - 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx - 1, cy + 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx + 1, cy + 1), size, pattern, tex));
+    }
+    else if (yEven && !xEven)
+    {
+        // G (R 行)
+        G = sample_raw_bayer(ivec2(cx, cy), size, pattern, tex);
+        R = 0.5 * (
+            sample_raw_bayer(ivec2(cx - 1, cy), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx + 1, cy), size, pattern, tex));
+        B = 0.5 * (
+            sample_raw_bayer(ivec2(cx, cy - 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx, cy + 1), size, pattern, tex));
+    }
+    else if (!yEven && xEven)
+    {
+        // G (B 行)
+        G = sample_raw_bayer(ivec2(cx, cy), size, pattern, tex);
+        R = 0.5 * (
+            sample_raw_bayer(ivec2(cx, cy - 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx, cy + 1), size, pattern, tex));
+        B = 0.5 * (
+            sample_raw_bayer(ivec2(cx - 1, cy), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx + 1, cy), size, pattern, tex));
+    }
+    else
+    {
+        // B 像素
+        B = sample_raw_bayer(ivec2(cx, cy), size, pattern, tex);
+        G = 0.25 * (
+            sample_raw_bayer(ivec2(cx - 1, cy),     size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx + 1, cy),     size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx,     cy - 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx,     cy + 1), size, pattern, tex));
+        R = 0.25 * (
+            sample_raw_bayer(ivec2(cx - 1, cy - 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx + 1, cy - 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx - 1, cy + 1), size, pattern, tex) +
+            sample_raw_bayer(ivec2(cx + 1, cy + 1), size, pattern, tex));
+    }
+
+    return vec3(R, G, B);
+}
+
 void main()
 {
-    // 保持长宽比：根据纹理和视口比例缩放 uv
+    // 先保持长宽比，把 vTexCoord 映射到“裁剪后的纹理 uv”，再做缩放/平移
     float texAspect    = uTexSize.x / uTexSize.y;
     float screenAspect = uViewportSize.x / uViewportSize.y;
 
@@ -186,20 +308,65 @@ void main()
         uv.y = y;
     }
 
-    vec3 c = texture(uBaseTex, uv).rgb;
+    // 再以纹理中心为基准做缩放/平移
+    vec2 uvCentered = uv - vec2(0.5);
+    uvCentered /= max(uZoom, 0.1);
+    uvCentered += vec2(0.5) + uPan;
 
+    if (uvCentered.x < 0.0 || uvCentered.x > 1.0 ||
+        uvCentered.y < 0.0 || uvCentered.y > 1.0)
+    {
+        FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    // === GPU 去拜耳 ===
+    vec3 c = debayer_bilinear(uvCentered, uBaseTex, uTexSize, uBayerPattern);
+
+    // === 白平衡 ===
+    c *= uWBGain;
+    c = clamp(c, 0.0, 1.0);
+
+    // === auto stretch ===
     if (uUseAuto)
     {
         float range = max(uHigh - uLow, 1e-3);
         vec3 t = (c - vec3(uLow)) / range;
         t = clamp(t, 0.0, 1.0);
 
-        float s = max(uStretchStrength, 1.0);
-        float denom = asinh(s);
-        vec3 stretched = asinh(s * t) / denom;
-        c = clamp(stretched, 0.0, 1.0);
+        if (uStretchMode == 0)
+        {
+            // 线性
+            c = t;
+        }
+        else if (uStretchMode == 1)
+        {
+            // asinh
+            float s = max(uStretchStrength, 1.0);
+            float denom = asinh(s);
+            vec3 stretched = asinh(s * t) / denom;
+            c = clamp(stretched, 0.0, 1.0);
+        }
+        else if (uStretchMode == 2)
+        {
+            // log: log(1 + k t) / log(1 + k)
+            float k = max(uStretchStrength, 1.0);
+            float denom = log(1.0 + k);
+            vec3 stretched = log(1.0 + k * t) / denom;
+            c = clamp(stretched, 0.0, 1.0);
+        }
+        else if (uStretchMode == 3)
+        {
+            // sqrt
+            c = sqrt(t);
+        }
+        else
+        {
+            c = t;
+        }
     }
 
+    // === Tone curve ===
     if (uUseCurve)
     {
         c.r = toneCurve(c.r, uCurveBlack, uCurveWhite, uCurveGamma);
@@ -243,6 +410,13 @@ void main()
     _uTexSizeLoc         = glGetUniformLocation(_shaderProgram, "uTexSize");
     _uViewportSizeLoc    = glGetUniformLocation(_shaderProgram, "uViewportSize");
 
+    _uStretchModeLoc     = glGetUniformLocation(_shaderProgram, "uStretchMode");
+    _uZoomLoc            = glGetUniformLocation(_shaderProgram, "uZoom");
+    _uPanLoc             = glGetUniformLocation(_shaderProgram, "uPan");
+
+    _uWBGainLoc          = glGetUniformLocation(_shaderProgram, "uWBGain");
+    _uBayerPatternLoc    = glGetUniformLocation(_shaderProgram, "uBayerPattern");
+
     glUniform1i(_uBaseTexLoc, 0);
 
     glUseProgram(0);
@@ -277,9 +451,9 @@ void GlImageRenderer::destroyShader()
     }
 }
 
-void GlImageRenderer::uploadBaseTexture(const std::vector<float>& linearRgb, int width, int height)
+void GlImageRenderer::uploadBaseTexture(const std::vector<float>& bayerOrGray, int width, int height)
 {
-    if (linearRgb.empty() || width <= 0 || height <= 0 || !_baseTexture)
+    if (bayerOrGray.empty() || width <= 0 || height <= 0 || !_baseTexture)
     {
         _hasTexture = false;
         return;
@@ -292,9 +466,9 @@ void GlImageRenderer::uploadBaseTexture(const std::vector<float>& linearRgb, int
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    // 用 float 纹理保存线性 RGB 数据
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, width, height,
-                 0, GL_RGB, GL_FLOAT, linearRgb.data());
+    // 保存单通道 Bayer / 灰度
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, width, height,
+                 0, GL_RED, GL_FLOAT, bayerOrGray.data());
 
     _hasTexture = true;
 }
@@ -309,18 +483,39 @@ void GlImageRenderer::setAutoParams(bool useAuto, float low, float high, float s
 
 void GlImageRenderer::setCurveParams(bool useCurve, float black, float white, float gamma)
 {
-    _useCurve    = useCurve;
-    _curveBlack  = black;
-    _curveWhite  = white;
-    _curveGamma  = gamma;
+    _useCurve   = useCurve;
+    _curveBlack = black;
+    _curveWhite = white;
+    _curveGamma = gamma;
+}
+
+void GlImageRenderer::setStretchMode(int mode)
+{
+    if (mode < 0) mode = 0;
+    if (mode > 3) mode = 3;
+    _stretchMode = mode;
+}
+
+void GlImageRenderer::setWhiteBalance(float rGain, float gGain, float bGain)
+{
+    _wbR = rGain;
+    _wbG = gGain;
+    _wbB = bGain;
+}
+
+void GlImageRenderer::setViewParams(float zoom, float panX, float panY)
+{
+    if (zoom < 0.1f) zoom = 0.1f;
+    if (zoom > 20.0f) zoom = 20.0f;
+    _zoom = zoom;
+    _panX = panX;
+    _panY = panY;
 }
 
 void GlImageRenderer::updateUniforms(int viewportWidth, int viewportHeight)
 {
     if (!_shaderProgram)
         return;
-
-    glUseProgram(_shaderProgram);
 
     glUniform1f(_uLowLoc,  _autoLow);
     glUniform1f(_uHighLoc, _autoHigh);
@@ -333,7 +528,14 @@ void GlImageRenderer::updateUniforms(int viewportWidth, int viewportHeight)
     glUniform1i(_uUseCurveLoc, _useCurve ? 1 : 0);
 
     glUniform2f(_uTexSizeLoc,      (float)_imgWidth,      (float)_imgHeight);
-    glUniform2f(_uViewportSizeLoc, (float)viewportWidth, (float)viewportHeight);
+    glUniform2f(_uViewportSizeLoc, (float)viewportWidth,  (float)viewportHeight);
+
+    glUniform1i(_uStretchModeLoc, _stretchMode);
+    glUniform1f(_uZoomLoc,        _zoom);
+    glUniform2f(_uPanLoc,         _panX, _panY);
+
+    glUniform3f(_uWBGainLoc, _wbR, _wbG, _wbB);
+    glUniform1i(_uBayerPatternLoc, _bayerPattern);
 }
 
 void GlImageRenderer::render(int viewportWidth, int viewportHeight)
