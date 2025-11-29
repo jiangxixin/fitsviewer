@@ -6,4 +6,4 @@
 // 实际使用时，把下面这两个变量替换成你自己的数据和大小。
 
 extern const unsigned int g_NotoSansSC_compressed_size;
-extern const unsigned int g_NotoSansSC_compressed_data[];
+extern const unsigned char g_NotoSansSC_compressed_data[];
