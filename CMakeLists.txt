@@ -38,6 +38,7 @@ elseif(WIN32)
     set(CFITSIO_INCLUDE_DIR ${CFITSIO_ROOT}/include)
     # ★ 按你实际编译出的名字改
     set(CFITSIO_LIB         ${CFITSIO_ROOT}/lib/cfitsio.lib)
+    set(ZLIB_LIB            ${CMAKE_SOURCE_DIR}/third_party_static/windows/zlib/zlibstatic.lib)
 
     set(GLFW_INCLUDE_DIR    ${GLFW_ROOT}/include)
     set(GLFW_LIB            ${GLFW_ROOT}/lib/glfw3.lib)
@@ -124,6 +125,7 @@ elseif(WIN32)
         PRIVATE
             ${CFITSIO_LIB}
             ${GLFW_LIB}
+            ${ZLIB_LIB}
             OpenGL::GL          # 通常映射到 opengl32.lib
             gdi32
             user32

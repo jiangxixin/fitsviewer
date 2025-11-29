@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <cmath>
 
 // NINA 风格 auto stretch（背景 + 百分位 + arcsinh）
 void auto_stretch(

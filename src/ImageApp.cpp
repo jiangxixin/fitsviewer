@@ -162,14 +162,14 @@ bool ImageApp::init()
         if (g_NotoSansSC_compressed_size > 0)
         {
             ImFontConfig cfg;
-            cfg.SizePixels = 13.0f;
+            cfg.SizePixels = 18.0f;
 
             const ImWchar* ranges = io.Fonts->GetGlyphRangesChineseFull();
 
             mainFont = io.Fonts->AddFontFromMemoryCompressedTTF(
                 (void*)g_NotoSansSC_compressed_data,
                 g_NotoSansSC_compressed_size,
-                13.0f,
+                18.0f,
                 &cfg,
                 ranges
             );
