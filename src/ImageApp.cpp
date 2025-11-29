@@ -99,7 +99,7 @@ static void AppSettings_WriteAll(ImGuiContext* ctx, ImGuiSettingsHandler* handle
 ImageApp::ImageApp() {}
 ImageApp::~ImageApp()
 {
-    shutdown();
+    //shutdown();
 }
 
 bool ImageApp::init()
@@ -251,7 +251,7 @@ void ImageApp::main_loop()
         int display_w, display_h;
         glfwGetFramebufferSize(_window, &display_w, &display_h);
 
-        // 用 UI 滑块控制缩放，鼠标右键平移
+        // 用 UI 滑块控制缩放，右键平移
         ImGuiIO& io = ImGui::GetIO();
         if (_hasImage)
         {
@@ -281,6 +281,7 @@ void ImageApp::render_ui()
 {
     ImGui::Begin("Controls");
 
+    // ===== 文件路径 / 打开 =====
     ImGui::InputText("FITS Path", &_currentPath);
     ImGui::SameLine();
     if (ImGui::Button("Browse..."))
@@ -292,7 +293,7 @@ void ImageApp::render_ui()
             load_fits_file(_currentPath);
     }
 
-    // Bayer 选择
+    // ===== Bayer 模式 =====
     const char* patterns[] = {"None", "RGGB", "BGGR", "GRBG", "GBRG"};
     int currentPattern = static_cast<int>(_bayerHint);
     bool bayerChanged = false;
@@ -309,7 +310,7 @@ void ImageApp::render_ui()
 
     ImGui::Separator();
 
-    // 拉伸模式
+    // ===== 拉伸模式 =====
     const char* stretchModes[] = {
         "Linear",
         "Arcsinh",
@@ -326,16 +327,16 @@ void ImageApp::render_ui()
         g_AppSettings.stretchMode = _stretchMode;
     }
 
-    // Auto stretch 参数
+    // ===== Auto Stretch 参数 =====
     bool autoParamsChanged = false;
 
     if (ImGui::Checkbox("Auto Stretch", &_autoStretch))
         autoParamsChanged = true;
 
-    if (ImGui::SliderFloat("Black clip %", &_blackClip, 0.0f, 5.0f))
+    if (ImGui::SliderFloat("Black clip %", &_blackClip, 0.0f, 20.0f))
         if (ImGui::IsItemEdited()) autoParamsChanged = true;
 
-    if (ImGui::SliderFloat("White clip %", &_whiteClip, 0.0f, 5.0f))
+    if (ImGui::SliderFloat("White clip %", &_whiteClip, 0.0f, 20.0f))
         if (ImGui::IsItemEdited()) autoParamsChanged = true;
 
     if (ImGui::SliderFloat("Stretch strength", &_stretchStrength, 1.0f, 20.0f))
@@ -344,6 +345,11 @@ void ImageApp::render_ui()
     if (stretchModeChanged)
         autoParamsChanged = true;
 
+    // Bayer 改变后，也需要重新统计自动拉伸 & 直方图
+    if (bayerChanged)
+        autoParamsChanged = true;
+
+    // ===== 调用 GPU 统计 auto 参数 + 更新直方图 =====
     if (autoParamsChanged && _hasImage)
     {
         float low = 0.0f, high = 1.0f;
@@ -351,19 +357,37 @@ void ImageApp::render_ui()
         {
             _autoLow  = low;
             _autoHigh = high;
+
+            _histogram.clear();
+            _renderer.getLuminanceHistogram(_histogram);
         }
         else
         {
             _autoLow  = 0.0f;
             _autoHigh = 1.0f;
+            _histogram.clear();
         }
 
         _renderer.setAutoParams(_autoStretch, _autoLow, _autoHigh, _stretchStrength);
     }
 
+    // ===== 实时亮度直方图（基于当前拉伸后的亮度） =====
+    if (!_histogram.empty())
+    {
+        ImGui::Text("Luma Histogram");
+        ImGui::PlotHistogram("##LumaHistogram",
+                             _histogram.data(),
+                             (int)_histogram.size(),
+                             0,
+                             nullptr,
+                             0.0f,
+                             1.0f,
+                             ImVec2(0, 80));
+    }
+
     ImGui::Separator();
 
-    // 手动曲线
+    // ===== 手动 Tone Curve =====
     bool curveChanged = false;
 
     if (ImGui::Checkbox("Use manual curve", &_useManualCurve))
@@ -394,7 +418,7 @@ void ImageApp::render_ui()
 
     ImGui::Separator();
 
-    // 视图 Scale 滑块
+    // ===== 视图 Scale 缩放 + Reset =====
     {
         float zoomMin = 0.1f, zoomMax = 20.0f;
         if (ImGui::SliderFloat("Scale", &_zoom, zoomMin, zoomMax, "%.2f", ImGuiSliderFlags_Logarithmic))
@@ -413,7 +437,7 @@ void ImageApp::render_ui()
 
     ImGui::Separator();
 
-    // 白平衡
+    // ===== 白平衡 =====
     bool wbChanged = false;
 
     if (ImGui::SliderFloat("R gain", &_wbR, 0.1f, 4.0f))
@@ -429,16 +453,38 @@ void ImageApp::render_ui()
         g_AppSettings.wbR = _wbR;
         g_AppSettings.wbG = _wbG;
         g_AppSettings.wbB = _wbB;
+
+        // 白平衡改变后也重新跑 auto stretch + 直方图
+        if (_hasImage)
+        {
+            float low = 0.0f, high = 1.0f;
+            if (_renderer.computeAutoParamsGpu(_autoStretch, _blackClip, _whiteClip, low, high))
+            {
+                _autoLow  = low;
+                _autoHigh = high;
+                _histogram.clear();
+                _renderer.getLuminanceHistogram(_histogram);
+            }
+            else
+            {
+                _autoLow  = 0.0f;
+                _autoHigh = 1.0f;
+                _histogram.clear();
+            }
+            _renderer.setAutoParams(_autoStretch, _autoLow, _autoHigh, _stretchStrength);
+        }
     }
 
     ImGui::Separator();
+
+    // ===== 导出 PNG（使用原文件名） =====
     if (ImGui::Button("Export PNG"))
     {
+        _exportJustSucceeded = false;
         if (_hasImage)
-            export_png("output.png");   // 形参现在已被忽略，但保留调用
+            export_png("ignored");   // 实现里已经用 _currentPath 生成真正路径
     }
 
-    // 导出成功提示
     if (_exportJustSucceeded && !_lastExportPath.empty())
     {
         ImGui::Spacing();
@@ -448,15 +494,17 @@ void ImageApp::render_ui()
 
     ImGui::End();
 
-
+    // ===== 文件对话框 =====
     if (_showFileDialog)
         render_file_dialog();
 
+    // Bayer 模式改变：即时更新 GPU Bayer pattern
     if (bayerChanged)
     {
         _renderer.setBayerPattern(static_cast<int>(_bayerHint));
     }
 }
+
 
 // ---------- 文件对话 ----------
 void ImageApp::open_file_dialog()
@@ -641,17 +689,21 @@ void ImageApp::load_fits_file(const std::string& path)
     _renderer.setWhiteBalance(_wbR, _wbG, _wbB);
     _renderer.setStretchMode(_stretchMode);
 
-    // GPU 统计 auto stretch 参数
+    // GPU 统计 auto stretch 参数 + 直方图
     float low = 0.0f, high = 1.0f;
     if (_renderer.computeAutoParamsGpu(_autoStretch, _blackClip, _whiteClip, low, high))
     {
         _autoLow  = low;
         _autoHigh = high;
+
+        _histogram.clear();
+        _renderer.getLuminanceHistogram(_histogram);
     }
     else
     {
         _autoLow  = 0.0f;
         _autoHigh = 1.0f;
+        _histogram.clear();
     }
 
     _renderer.setAutoParams(_autoStretch, _autoLow, _autoHigh, _stretchStrength);
@@ -664,26 +716,9 @@ void ImageApp::export_png(const std::string& /*path_unused*/)
     if (!_hasImage || _imgWidth <= 0 || _imgHeight <= 0)
         return;
 
-    // 1. 基于当前 FITS 路径生成导出 PNG 文件名
-    fs::path inPath(_currentPath);
-    fs::path outPath;
-
-    if (!inPath.empty())
-    {
-        // 如果有原文件，就用同目录 + 同名改后缀
-        outPath = inPath;
-        outPath.replace_extension(".png");
-    }
-    else
-    {
-        // 如果当前路径是空的，退回当前工作目录下的 default.png
-        outPath = fs::current_path() / "output.png";
-    }
-
-    // 2. 确保 GPU 使用当前视图参数（缩放 / 平移）
+    // 使用当前视图参数
     _renderer.setViewParams(_zoom, _panX, _panY);
 
-    // 3. 让 GPU 渲染全分辨率图像，并读回 RGB8
     std::vector<unsigned char> rgb;
     if (!_renderer.renderToImage(_imgWidth, _imgHeight, rgb))
     {
@@ -692,9 +727,21 @@ void ImageApp::export_png(const std::string& /*path_unused*/)
         return;
     }
 
-    // 4. 写 PNG
-    int stride = _imgWidth * 3;
+    fs::path inPath(_currentPath);
+    fs::path outPath;
+
+    if (!inPath.empty())
+    {
+        outPath = inPath;
+        outPath.replace_extension(".png");
+    }
+    else
+    {
+        outPath = fs::current_path() / "output.png";
+    }
+
     std::string outStr = outPath.string();
+    int stride = _imgWidth * 3;
 
     if (!stbi_write_png(outStr.c_str(), _imgWidth, _imgHeight, 3,
                         rgb.data(), stride))
@@ -709,4 +756,3 @@ void ImageApp::export_png(const std::string& /*path_unused*/)
         std::cout << "PNG saved to " << _lastExportPath << "\n";
     }
 }
-

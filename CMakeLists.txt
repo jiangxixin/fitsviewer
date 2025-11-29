@@ -1,64 +1,44 @@
 cmake_minimum_required(VERSION 3.15)
+
 project(FitsViewer LANGUAGES C CXX)
 
-# ---------------- C++ 标准 ----------------
+# ====================== 基本编译选项 ======================
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ---------------- CFITSIO 手动查找 ----------------
-# 如用 Homebrew: brew install cfitsio
-set(CFITSIO_HINT_PATHS
-    /opt/homebrew        # Apple Silicon 默认
-    /usr/local           # Intel Mac / 一些 Linux
-    /usr
-)
-
-find_path(CFITSIO_INCLUDE_DIR
-    NAMES fitsio.h
-    PATH_SUFFIXES include
-    PATHS ${CFITSIO_HINT_PATHS}
-)
-
-find_library(CFITSIO_LIBRARY
-    NAMES cfitsio
-    PATH_SUFFIXES lib
-    PATHS ${CFITSIO_HINT_PATHS}
-)
-
-if (NOT CFITSIO_INCLUDE_DIR OR NOT CFITSIO_LIBRARY)
-    message(FATAL_ERROR "CFITSIO not found. Please install it first (e.g. brew install cfitsio).")
-else()
-    message(STATUS "CFITSIO include: ${CFITSIO_INCLUDE_DIR}")
-    message(STATUS "CFITSIO library: ${CFITSIO_LIBRARY}")
+# 确保生成 arm64 可执行文件（Apple Silicon）
+if(APPLE)
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "" FORCE)
 endif()
 
-# ---------------- OpenGL & GLFW ----------------
-# Homebrew: brew install glfw
-find_package(OpenGL REQUIRED)
-find_package(glfw3 REQUIRED)
+# ====================== 第三方静态库路径 ======================
+# 手动编译好的 cfitsio / glfw3 静态库安装位置
+set(CFITSIO_ROOT ${CMAKE_SOURCE_DIR}/third_party_static/cfitsio)
+set(GLFW_ROOT    ${CMAKE_SOURCE_DIR}/third_party_static/glfw)
 
-# ---------------- ImGui 路径 ----------------
-# 请把官方 imgui 仓库放到 third_party/imgui
+set(CFITSIO_INCLUDE_DIR ${CFITSIO_ROOT}/include)
+set(CFITSIO_LIB         ${CFITSIO_ROOT}/lib/libcfitsio.a)
+
+set(GLFW_INCLUDE_DIR    ${GLFW_ROOT}/include)
+set(GLFW_LIB            ${GLFW_ROOT}/lib/libglfw3.a)
+
+# 简单检查库是否存在，防止路径写错
+if(NOT EXISTS ${CFITSIO_LIB})
+    message(FATAL_ERROR "CFITSIO static lib not found: ${CFITSIO_LIB}")
+endif()
+if(NOT EXISTS ${GLFW_LIB})
+    message(FATAL_ERROR "GLFW static lib not found: ${GLFW_LIB}")
+endif()
+
+# ====================== OpenGL & 系统框架 ======================
+find_package(OpenGL REQUIRED)
+
+find_package(ZLIB REQUIRED)
+
+# ====================== ImGui / glad 源码 ======================
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
 
-# ---------------- GLAD ----------------
-# 在线生成的 glad 放在 third_party_gl
-set(GLAD_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/third_party_gl/include)
-set(GLAD_SOURCES      ${CMAKE_SOURCE_DIR}/third_party_gl/src/glad.c)
-
-# ---------------- 头文件搜索路径 ----------------
-include_directories(
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/external
-    ${CFITSIO_INCLUDE_DIR}
-    ${IMGUI_DIR}
-    ${IMGUI_DIR}/backends
-    ${IMGUI_DIR}/misc/cpp
-    ${GLAD_INCLUDE_DIR}
-)
-
-# ---------------- ImGui 源码列表 ----------------
 set(IMGUI_SOURCES
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
@@ -69,7 +49,23 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
 )
 
-# ---------------- 可执行文件 ----------------
+set(GLAD_SOURCES
+    ${CMAKE_SOURCE_DIR}/third_party_gl/src/glad.c
+)
+
+# ====================== 头文件搜索路径 ======================
+include_directories(
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/external              # stb_image_write.h 等
+    ${CMAKE_SOURCE_DIR}/third_party_gl/include
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
+    ${IMGUI_DIR}/misc/cpp
+    ${CFITSIO_INCLUDE_DIR}
+    ${GLFW_INCLUDE_DIR}
+)
+
+# ====================== 可执行文件 ======================
 add_executable(FitsViewer
     src/main.cpp
     src/FitsImage.cpp
@@ -77,38 +73,29 @@ add_executable(FitsViewer
     src/Stretch.cpp
     src/ImageApp.cpp
     src/GlImageRenderer.cpp
-    src/EmbeddedFont.cpp
+    src/EmbeddedFont.cpp        # 如果没用内嵌字体，可以删掉这一行
     ${IMGUI_SOURCES}
     ${GLAD_SOURCES}
 )
 
-# 让 imgui_impl_opengl3 使用 GLAD 作为 OpenGL loader
-target_compile_definitions(FitsViewer
-    PRIVATE
-        IMGUI_IMPL_OPENGL_LOADER_GLAD
-)
+# ImGui OpenGL backend 使用 GLAD 作为 loader
+target_compile_definitions(FitsViewer PRIVATE IMGUI_IMPL_OPENGL_LOADER_GLAD)
 
-# ---------------- 链接库 ----------------
+# ====================== 链接静态库和系统库 ======================
 target_link_libraries(FitsViewer
     PRIVATE
-        ${CFITSIO_LIBRARY}
-        glfw
+        ${CFITSIO_LIB}
+        ${GLFW_LIB}
+        ZLIB::ZLIB
         OpenGL::GL
 )
 
-# ---------------- macOS 额外 Framework ----------------
-if (APPLE)
+# macOS 下需要显式链接系统 Framework
+if(APPLE)
     target_link_libraries(FitsViewer
         PRIVATE
             "-framework Cocoa"
             "-framework IOKit"
             "-framework CoreVideo"
-    )
-endif()
-
-# ---------------- Windows 上去掉控制台窗口（可选） ----------------
-if (WIN32)
-    set_target_properties(FitsViewer PROPERTIES
-        WIN32_EXECUTABLE TRUE
     )
 endif()

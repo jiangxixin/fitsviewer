@@ -73,6 +73,13 @@ private:
     float _panX             = 0.0f;
     float _panY             = 0.0f;
 
+    // 亮度直方图（从 GlImageRenderer 拷贝，用于 UI 绘制）
+    std::vector<float> _histogram;
+
+    // 导出状态
+    std::string _lastExportPath;
+    bool        _exportJustSucceeded = false;
+
     // 文件对话框
     bool _showFileDialog    = false;
     std::string _fileDialogDir;
@@ -80,7 +87,4 @@ private:
     bool _fileListDirty     = true;
 
     struct GLFWwindow* _window = nullptr;
-
-    std::string _lastExportPath;
-    bool        _exportJustSucceeded = false;
 };

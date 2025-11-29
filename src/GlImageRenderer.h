@@ -5,7 +5,7 @@
 // 负责 GPU 渲染：
 // - 保存 Bayer/灰度纹理（单通道）
 // - shader 内完成：去拜耳 + 白平衡 + auto stretch + tone curve + 多种拉伸模式 + 缩放/平移
-// - 提供 GPU 统计亮度 + GPU 导出 PNG 能力
+// - 提供 GPU 统计亮度 + GPU 导出 PNG + UI 直方图
 class GlImageRenderer
 {
 public:
@@ -40,7 +40,7 @@ public:
     // 每帧调用，viewport 是当前帧缓冲大小
     void render(int viewportWidth, int viewportHeight);
 
-    // 在 GPU 上生成亮度统计纹理，然后 CPU 上做 percentile + median/MAD
+    // GPU 上生成亮度统计纹理，然后 CPU 上对小纹理做 percentile/median/MAD 等
     // 输入：blackClip / whiteClip 百分比（%），输出：low/high in [0,1]
     bool computeAutoParamsGpu(bool useAuto,
                               float blackClip,
@@ -50,6 +50,9 @@ public:
 
     // 使用当前 shader 状态，把结果渲染到 outWidth x outHeight，然后读回 RGB8
     bool renderToImage(int outWidth, int outHeight, std::vector<unsigned char>& outRGB);
+
+    // 拷贝最新的亮度直方图（如果还没统计过，返回 false）
+    bool getLuminanceHistogram(std::vector<float>& outHist) const;
 
     bool hasImage() const { return _hasTexture; }
     int  imageWidth() const { return _imgWidth; }
@@ -137,4 +140,8 @@ private:
 
     // Bayer 模式（GPU 去拜耳用）
     int   _bayerPattern    = 1;     // 默认 RGGB
+
+    // 亮度直方图
+    static constexpr int _histBins = 64;
+    std::vector<float>   _histogram;
 };

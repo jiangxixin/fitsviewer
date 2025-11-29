@@ -3,6 +3,7 @@
 #include <glad/glad.h>
 #include <iostream>
 #include <cmath>
+#include <algorithm>
 
 static inline float clamp01(float v)
 {
@@ -79,6 +80,8 @@ bool GlImageRenderer::init()
         return false;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    _histogram.assign(_histBins, 0.0f);
 
     return true;
 }
@@ -353,8 +356,8 @@ void main()
     uvCentered /= max(uZoom, 0.1);
     uvCentered += vec2(0.5) + uPan;
 
-    if (uvCentered.x < 0.0 || uvCentered.x > 1.0 ||
-        uvCentered.y < 0.0 || uvCentered.y > 1.0)
+    if (uvCentered.x < 0.0 || uvCentered.y < 0.0 ||
+        uvCentered.x > 1.0 || uvCentered.y > 1.0)
     {
         FragColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
@@ -590,6 +593,7 @@ void main()
 {
     vec2 uv = vTexCoord;
 
+    // 统计时不需要保持屏幕比例，只要均匀采样整个图像即可
     vec3 c = debayer_bilinear(uv, uBaseTex, uTexSize, uBayerPattern);
 
     // 白平衡
@@ -765,7 +769,6 @@ void GlImageRenderer::render(int viewportWidth, int viewportHeight)
     glUseProgram(0);
 }
 
-// GPU 统计：在 stats FBO 上渲 256x256 亮度，然后 CPU 做统计
 bool GlImageRenderer::computeAutoParamsGpu(bool useAuto,
                                            float blackClip,
                                            float whiteClip,
@@ -786,6 +789,7 @@ bool GlImageRenderer::computeAutoParamsGpu(bool useAuto,
         return true;
     }
 
+    // === 1. 在统计 FBO 上渲染亮度图（256x256） ===
     GLint prevFBO = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
     GLint prevViewport[4];
@@ -808,6 +812,7 @@ bool GlImageRenderer::computeAutoParamsGpu(bool useAuto,
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     glBindVertexArray(0);
 
+    // === 2. 从统计纹理读回“线性 + 白平衡后”的亮度数据（RED 通道） ===
     std::vector<float> lum;
     lum.resize((size_t)_statsSize * _statsSize);
     glReadPixels(0, 0, _statsSize, _statsSize, GL_RED, GL_FLOAT, lum.data());
@@ -823,19 +828,17 @@ bool GlImageRenderer::computeAutoParamsGpu(bool useAuto,
         return false;
     }
 
+    // === 3. 按百分位计算黑白点（blackClip / whiteClip） ===
     std::vector<float> sorted = lum;
     std::sort(sorted.begin(), sorted.end());
 
     size_t n = sorted.size();
-    size_t mid = n / 2;
-    float median = (n % 2 == 0) ? 0.5f * (sorted[mid - 1] + sorted[mid]) : sorted[mid];
-
-    std::vector<float> devs(n);
-    for (size_t i = 0; i < n; ++i)
-        devs[i] = std::fabs(lum[i] - median);
-    std::sort(devs.begin(), devs.end());
-    float mad = (n % 2 == 0) ? 0.5f * (devs[mid - 1] + devs[mid]) : devs[mid];
-    if (mad < 1e-6f) mad = 1e-6f;
+    if (n == 0)
+    {
+        outLow = 0.0f;
+        outHigh = 1.0f;
+        return false;
+    }
 
     auto clampPercent = [](float v) {
         if (v < 0.0f) return 0.0f;
@@ -855,27 +858,80 @@ bool GlImageRenderer::computeAutoParamsGpu(bool useAuto,
     if (idxHigh >= n) idxHigh = n - 1;
     if (idxLow > idxHigh) idxLow = 0;
 
-    float lowP  = sorted[idxLow];
-    float highP = sorted[idxHigh];
-
-    const float kSigma = 1.5f;
-    float candidateLow = clamp01(median - kSigma * mad);
-
-    float low  = std::max(candidateLow, lowP);
-    float high = std::max(highP, low + 1e-3f);
+    float low  = sorted[idxLow];
+    float high = sorted[idxHigh];
 
     if (high <= low + 1e-4f)
+        high = low + 1e-3f;
+
+    outLow  = clamp01(low);
+    outHigh = clamp01(high);
+
+    // === 4. 基于“拉伸后的亮度”构建直方图（真正和画面一致） ===
+    _histogram.assign(_histBins, 0.0f);
+
+    float range = std::max(outHigh - outLow, 1e-3f);
+    float s = std::max(_stretchStrength, 1.0f);
+    float asinhDenom = std::asinh(s);
+    if (asinhDenom < 1e-6f) asinhDenom = 1e-6f;
+    float logDenom = std::log(1.0f + s);
+    if (logDenom < 1e-6f) logDenom = 1e-6f;
+
+    for (float v : lum)
     {
-        low  = lowP;
-        high = std::max(highP, low + 1e-3f);
+        // 线性裁剪到 [low, high]
+        float t = (v - outLow) / range;
+        t = clamp01(t);
+
+        // 按当前 stretch 模式变换（和主 shader 一致）
+        float y = t;
+        if (_stretchMode == 0)
+        {
+            // Linear
+            y = t;
+        }
+        else if (_stretchMode == 1)
+        {
+            // Arcsinh
+            y = std::asinh(s * t) / asinhDenom;
+        }
+        else if (_stretchMode == 2)
+        {
+            // Log
+            y = std::log(1.0f + s * t) / logDenom;
+        }
+        else if (_stretchMode == 3)
+        {
+            // Sqrt
+            y = std::sqrt(t);
+        }
+        y = clamp01(y);
+
+        int bin = (int)(y * _histBins);
+        if (bin < 0) bin = 0;
+        if (bin >= _histBins) bin = _histBins - 1;
+        _histogram[bin] += 1.0f;
     }
 
-    outLow  = low;
-    outHigh = high;
+    // 归一化到 [0,1]，再做 sqrt 拉起小值，视觉更平滑
+    float maxCount = 0.0f;
+    for (float c : _histogram)
+        if (c > maxCount) maxCount = c;
+
+    if (maxCount > 0.0f)
+    {
+        for (float& c : _histogram)
+        {
+            c /= maxCount;         // 先归一化
+            c = std::sqrt(c);      // 再 sqrt 提升小值（可换成 pow(c, 0.3f) 更夸张）
+        }
+    }
+
     return true;
 }
 
-// 使用当前 shader 把结果渲到 outWidth x outHeight，然后读回 RGB8
+
+
 bool GlImageRenderer::renderToImage(int outWidth, int outHeight, std::vector<unsigned char>& outRGB)
 {
     if (!_hasTexture || !_shaderProgram || !_quadVAO || outWidth <= 0 || outHeight <= 0)
@@ -929,7 +985,7 @@ bool GlImageRenderer::renderToImage(int outWidth, int outHeight, std::vector<uns
     outRGB.resize((size_t)outWidth * outHeight * 3);
     glReadPixels(0, 0, outWidth, outHeight, GL_RGB, GL_UNSIGNED_BYTE, outRGB.data());
 
-    // 垂直翻转（OpenGL 原点在左下，PNG 希望左上）
+    // 垂直翻转（OpenGL 原点在左下，导出希望左上）
     int rowBytes = outWidth * 3;
     for (int y = 0; y < outHeight / 2; ++y)
     {
@@ -943,5 +999,13 @@ bool GlImageRenderer::renderToImage(int outWidth, int outHeight, std::vector<uns
     glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
     glUseProgram(0);
 
+    return true;
+}
+
+bool GlImageRenderer::getLuminanceHistogram(std::vector<float>& outHist) const
+{
+    if (_histogram.empty())
+        return false;
+    outHist = _histogram;
     return true;
 }
