@@ -2,12 +2,11 @@ cmake_minimum_required(VERSION 3.15)
 
 project(FitsViewer LANGUAGES C CXX)
 
-# ====================== 基本编译选项 ======================
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# macOS 上确保生成 arm64（Apple Silicon）
+# macOS 上指定 ARM64（Apple Silicon）
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "" FORCE)
 endif()
@@ -36,9 +35,8 @@ elseif(WIN32)
     set(GLFW_ROOT    ${PLATFORM_STATIC_ROOT}/glfw)
 
     set(CFITSIO_INCLUDE_DIR ${CFITSIO_ROOT}/include)
-    # ★ 按你实际编译出的名字改
+    # ★ 按你实际编译结果改名
     set(CFITSIO_LIB         ${CFITSIO_ROOT}/lib/cfitsio.lib)
-    set(ZLIB_LIB            ${CMAKE_SOURCE_DIR}/third_party_static/windows/zlib/zlibstatic.lib)
 
     set(GLFW_INCLUDE_DIR    ${GLFW_ROOT}/include)
     set(GLFW_LIB            ${GLFW_ROOT}/lib/glfw3.lib)
@@ -47,7 +45,7 @@ else()
     message(FATAL_ERROR "Unsupported platform: only macOS and Windows are configured")
 endif()
 
-# 简单检查库是否存在，防止路径写错
+# 简单检查库是否存在
 if(NOT EXISTS ${CFITSIO_LIB})
     message(FATAL_ERROR "CFITSIO static lib not found: ${CFITSIO_LIB}")
 endif()
@@ -55,15 +53,15 @@ if(NOT EXISTS ${GLFW_LIB})
     message(FATAL_ERROR "GLFW static lib not found: ${GLFW_LIB}")
 endif()
 
-# ====================== 查找 OpenGL / zlib ======================
+# ====================== 查找系统 OpenGL / zlib ======================
 find_package(OpenGL REQUIRED)
 
 if(APPLE)
-    # cfitsio 默认带 zlib 压缩支持（如果你在 configure 里没关掉）
+    # 如果 cfitsio 编译时保留了 zlib 支持，则需要链接 zlib
     find_package(ZLIB REQUIRED)
 endif()
 
-# ====================== ImGui / glad 源码 ======================
+# ====================== ImGui & glad 源码 ======================
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
 
 set(IMGUI_SOURCES
@@ -80,10 +78,11 @@ set(GLAD_SOURCES
     ${CMAKE_SOURCE_DIR}/third_party_gl/src/glad.c
 )
 
-# ====================== 头文件搜索路径 ======================
+# ====================== include 路径 ======================
 include_directories(
+    ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/external              # stb_image_write.h 等
+    ${CMAKE_SOURCE_DIR}/external              # stb_image_write.h
     ${CMAKE_SOURCE_DIR}/third_party_gl/include
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
@@ -92,41 +91,67 @@ include_directories(
     ${GLFW_INCLUDE_DIR}
 )
 
-# ====================== 可执行文件 ======================
-add_executable(FitsViewer
-    src/main.cpp
-    src/FitsImage.cpp
-    src/Debayer.cpp
-    src/Stretch.cpp
-    src/ImageApp.cpp
-    src/GlImageRenderer.cpp
-    src/EmbeddedFont.cpp        # 如果没有内嵌字体，这行可以删掉
-    ${IMGUI_SOURCES}
-    ${GLAD_SOURCES}
+# ====================== 核心库：kty_fits_core ======================
+add_library(kty_fits_core
+    src/core/FitsRenderer.cpp
+    src/core/FitsImage.cpp
+    src/core/Debayer.cpp
+    src/core/Stretch.cpp
+    src/core/GlImageRenderer.cpp
 )
 
-target_compile_definitions(FitsViewer PRIVATE IMGUI_IMPL_OPENGL_LOADER_GLAD)
+target_link_libraries(kty_fits_core
+    PRIVATE
+        ${CFITSIO_LIB}
+        ${GLFW_LIB}
+        OpenGL::GL
+)
 
-# ====================== 链接静态库 + 系统库 ======================
 if(APPLE)
-    target_link_libraries(FitsViewer
+    target_link_libraries(kty_fits_core
         PRIVATE
-            ${CFITSIO_LIB}
-            ${GLFW_LIB}
-            ZLIB::ZLIB          # 保留 zlib 压缩支持（如果 configure 时没关）
-            OpenGL::GL
+            ZLIB::ZLIB
             "-framework Cocoa"
             "-framework IOKit"
             "-framework CoreVideo"
     )
-
 elseif(WIN32)
-    target_link_libraries(FitsViewer
+    target_link_libraries(kty_fits_core
         PRIVATE
-            ${CFITSIO_LIB}
-            ${GLFW_LIB}
-            ${ZLIB_LIB}
-            OpenGL::GL          # 通常映射到 opengl32.lib
+            gdi32
+            user32
+            shell32
+            advapi32
+            winmm
+    )
+endif()
+
+# ====================== ImGui 前端可执行文件 ======================
+add_executable(FitsViewer_imgui
+    src/main.cpp
+    src/ui/ImguiApp.cpp
+    ${IMGUI_SOURCES}
+    ${GLAD_SOURCES}
+)
+
+target_compile_definitions(FitsViewer_imgui PRIVATE IMGUI_IMPL_OPENGL_LOADER_GLAD)
+
+target_link_libraries(FitsViewer_imgui
+    PRIVATE
+        kty_fits_core
+        OpenGL::GL
+)
+
+if(APPLE)
+    target_link_libraries(FitsViewer_imgui
+        PRIVATE
+            "-framework Cocoa"
+            "-framework IOKit"
+            "-framework CoreVideo"
+    )
+elseif(WIN32)
+    target_link_libraries(FitsViewer_imgui
+        PRIVATE
             gdi32
             user32
             shell32
