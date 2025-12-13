@@ -702,6 +702,154 @@ void GlImageRenderer::setWhiteBalance(float r, float g, float b)
     _wbB = b;
 }
 
+bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
+                                                 float& outGainG,
+                                                 float& outGainB)
+{
+    if (!_hasTexture || !_shaderProgram || !_quadVAO)
+        return false;
+
+    // ==== 1. 备份当前状态（AutoStretch + WhiteBalance） ====
+    bool  oldUseAuto   = _useAuto;
+    float oldLow       = _autoLow;
+    float oldHigh      = _autoHigh;
+    float oldStrength  = _stretchStrength;
+    float oldWbR       = _wbR;
+    float oldWbG       = _wbG;
+    float oldWbB       = _wbB;
+
+    // 临时设置白平衡为 1,1,1，关闭 AutoStretch，保持线性
+    _wbR = _wbG = _wbB = 1.0f;
+    _useAuto = false;
+    _autoLow = 0.0f;
+    _autoHigh = 1.0f;
+    // _stretchStrength 无所谓，反正 uUseAuto = false
+    setWhiteBalance(_wbR, _wbG, _wbB);
+    setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+
+    // ==== 2. 用小尺寸预览渲染一张 RGB 图（GPU debayer 完成） ====
+    const int S = 256;  // 统计用预览尺寸
+    if (!renderPreview(S, S))
+    {
+        // 还原状态
+        _wbR = oldWbR; _wbG = oldWbG; _wbB = oldWbB;
+        _useAuto = oldUseAuto; _autoLow = oldLow; _autoHigh = oldHigh;
+        setWhiteBalance(_wbR, _wbG, _wbB);
+        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+        return false;
+    }
+
+    // 从预览 FBO 读回图像
+    if (!_previewFBO || !_previewTex)
+    {
+        // 还原状态
+        _wbR = oldWbR; _wbG = oldWbG; _wbB = oldWbB;
+        _useAuto = oldUseAuto; _autoLow = oldLow; _autoHigh = oldHigh;
+        setWhiteBalance(_wbR, _wbG, _wbB);
+        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+        return false;
+    }
+
+    GLint prevFBO = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, _previewFBO);
+
+    std::vector<float> pixels;
+    pixels.resize((size_t)S * S * 3);
+
+    // 预览纹理是 GL_RGB8，将其作为 float 读回会自动归一化到 [0,1]
+    glReadPixels(0, 0, S, S, GL_RGB, GL_FLOAT, pixels.data());
+
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
+
+    // ==== 3. 在 CPU 上对这张 debayer 后的小图做 Grey-World + 亮度过滤 ====
+    double sumR = 0.0;
+    double sumG = 0.0;
+    double sumB = 0.0;
+    size_t count = 0;
+
+    for (int y = 0; y < S; ++y)
+    {
+        for (int x = 0; x < S; ++x)
+        {
+            size_t idx = ((size_t)y * S + x) * 3;
+            float r = pixels[idx + 0];
+            float g = pixels[idx + 1];
+            float b = pixels[idx + 2];
+
+            // 亮度（注意这是线性 debayer 后的亮度）
+            float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+
+            // 过滤掉太暗/太亮，避免噪声和饱和星点；这就是 "天文友好" 的第一步
+            if (l < 0.10f || l > 0.90f)
+                continue;
+
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            ++count;
+        }
+    }
+
+    if (count == 0)
+    {
+        // 没有合适采样点，恢复状态
+        _wbR = oldWbR; _wbG = oldWbG; _wbB = oldWbB;
+        _useAuto = oldUseAuto; _autoLow = oldLow; _autoHigh = oldHigh;
+        setWhiteBalance(_wbR, _wbG, _wbB);
+        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+        return false;
+    }
+
+    double meanR = sumR / (double)count;
+    double meanG = sumG / (double)count;
+    double meanB = sumB / (double)count;
+
+    if (meanR <= 0.0 || meanG <= 0.0 || meanB <= 0.0)
+    {
+        _wbR = oldWbR; _wbG = oldWbG; _wbB = oldWbB;
+        _useAuto = oldUseAuto; _autoLow = oldLow; _autoHigh = oldHigh;
+        setWhiteBalance(_wbR, _wbG, _wbB);
+        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+        return false;
+    }
+
+    double meanGrey = (meanR + meanG + meanB) / 3.0;
+
+    float gR = (float)(meanGrey / meanR);
+    float gG = (float)(meanGrey / meanG);
+    float gB = (float)(meanGrey / meanB);
+
+    auto clampGain = [](float g) {
+        if (g < 0.25f) g = 0.25f;
+        if (g > 4.0f)  g = 4.0f;
+        return g;
+    };
+
+    gR = clampGain(gR);
+    gG = clampGain(gG);
+    gB = clampGain(gB);
+
+    // ==== 4. 把计算结果写回，并恢复 AutoStretch 状态 ====
+    _wbR = gR;
+    _wbG = gG;
+    _wbB = gB;
+    setWhiteBalance(_wbR, _wbG, _wbB);
+
+    // 恢复 AutoStretch/low/high，但不覆盖新的白平衡
+    _useAuto         = oldUseAuto;
+    _autoLow         = oldLow;
+    _autoHigh        = oldHigh;
+    _stretchStrength = oldStrength;
+    setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+
+    outGainR = gR;
+    outGainG = gG;
+    outGainB = gB;
+    return true;
+}
+
 void GlImageRenderer::setStretchMode(int mode)
 {
     _stretchMode = mode;

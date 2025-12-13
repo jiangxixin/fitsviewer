@@ -129,136 +129,16 @@ void FitsRenderer::setWhiteBalance(const WhiteBalance& wb)
 
 bool FitsRenderer::computeAutoWhiteBalance()
 {
-    if (!_hasImage || !asFits(_fits))
+    if (!_hasImage || !asGl(_gl))
         return false;
 
-    const FitsImage* fi = asFits(_fits);
-    int W = fi->width;
-    int H = fi->height;
-    if (W <= 0 || H <= 0)
+    float gR = 1.0f, gG = 1.0f, gB = 1.0f;
+    if (!asGl(_gl)->computeAutoWhiteBalanceGpu(gR, gG, gB))
         return false;
 
-    // ==== 1. 准备一个可用于统计的 RGB 图像 ====
-    // 优先使用已有的 fi->rgb（如果你已经在别处做过 CPU 去拜耳）
-    FitsImage tempRgb;
-    const FitsImage* srcRgb = nullptr;
-
-    if (!fi->rgb.empty() && fi->channels == 3)
-    {
-        // 假设 fi->rgb 已经是 [0,1] 的 RGB
-        srcRgb = fi;
-    }
-    else
-    {
-        // 没有现成 rgb，就用已有的 debayer_bilinear 做一次 CPU 去拜耳（只为统计）
-        // 注意：这里假设你有 debayer_bilinear(const FitsImage&, FitsImage&)，否则可以根据你现在的 Debayer 接口替换
-        if (!debayer_bilinear(*fi, tempRgb))
-        {
-            // 去拜耳失败了，就没法做自动白平衡
-            return false;
-        }
-        srcRgb = &tempRgb;
-    }
-
-    if (!srcRgb || srcRgb->rgb.empty() || srcRgb->channels != 3)
-        return false;
-
-    const std::vector<float>& rgb = srcRgb->rgb;
-    int width  = srcRgb->width;
-    int height = srcRgb->height;
-
-    // ==== 2. 再做一次简单的归一化（防御性，避免某些路径下 rgb 不在 0~1）====
-    float minVal = 1e9f;
-    float maxVal = -1e9f;
-    for (size_t i = 0; i < rgb.size(); ++i)
-    {
-        float v = rgb[i];
-        if (v < minVal) minVal = v;
-        if (v > maxVal) maxVal = v;
-    }
-    if (maxVal <= minVal)
-    {
-        minVal = 0.0f;
-        maxVal = 1.0f;
-    }
-    float invRange = 1.0f / (maxVal - minVal);
-
-    auto norm = [&](float v) -> float {
-        float t = (v - minVal) * invRange;
-        if (t < 0.0f) t = 0.0f;
-        if (t > 1.0f) t = 1.0f;
-        return t;
-    };
-
-    // ==== 3. 灰度世界算法（Grey-World） + 亮度过滤 ====
-    const size_t targetSamples = 200000;
-    size_t total = (size_t)width * (size_t)height;
-    int step = 1;
-    if (total > targetSamples)
-    {
-        step = (int)std::sqrt((double)total / (double)targetSamples);
-        if (step < 1) step = 1;
-    }
-
-    double sumR = 0.0;
-    double sumG = 0.0;
-    double sumB = 0.0;
-    size_t count = 0;
-
-    for (int y = 0; y < height; y += step)
-    {
-        for (int x = 0; x < width; x += step)
-        {
-            size_t idx = ((size_t)y * width + x) * 3;
-            float r = norm(rgb[idx + 0]);
-            float g = norm(rgb[idx + 1]);
-            float b = norm(rgb[idx + 2]);
-
-            // 计算亮度，用于剔除太暗/太亮的像素
-            float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-            if (l < 0.10f || l > 0.90f)
-                continue;
-
-            sumR += r;
-            sumG += g;
-            sumB += b;
-            ++count;
-        }
-    }
-
-    if (count == 0)
-        return false;
-
-    double meanR = sumR / (double)count;
-    double meanG = sumG / (double)count;
-    double meanB = sumB / (double)count;
-
-    if (meanR <= 0.0 || meanG <= 0.0 || meanB <= 0.0)
-        return false;
-
-    double meanGrey = (meanR + meanG + meanB) / 3.0;
-
-    float gR = (float)(meanGrey / meanR);
-    float gG = (float)(meanGrey / meanG);
-    float gB = (float)(meanGrey / meanB);
-
-    // 防止增益过分极端
-    auto clampGain = [](float g) {
-        if (g < 0.25f) g = 0.25f;
-        if (g > 4.0f)  g = 4.0f;
-        return g;
-    };
-
-    gR = clampGain(gR);
-    gG = clampGain(gG);
-    gB = clampGain(gB);
-
-    // ==== 4. 更新内部白平衡参数，并同步到 GL ====
     _wb.r = gR;
     _wb.g = gG;
     _wb.b = gB;
-
-    asGl(_gl)->setWhiteBalance(_wb.r, _wb.g, _wb.b);
 
     return true;
 }

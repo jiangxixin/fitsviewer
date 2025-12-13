@@ -39,6 +39,9 @@ public:
                               float& outLow,
                               float& outHigh);
 
+    // 使用 GPU debayer + 小预览纹理做自动白平衡
+    bool computeAutoWhiteBalanceGpu(float& outGainR, float& outGainG, float& outGainB);
+
     // 全分辨率渲染到离屏 FBO 并读回 RGB8（用于导出 PNG）
     bool renderToImage(int width, int height, std::vector<unsigned char>& outRGB);
 

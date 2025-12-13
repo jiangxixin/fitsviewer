@@ -171,43 +171,50 @@ void ImguiApp::render_ui()
     ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
     ImGuiDockNodeFlags dockFlags = ImGuiDockNodeFlags_None;
 
-    // === 一次性初始化 Dock 布局 ===
+    // 一次性初始化 Dock 布局
     static bool firstTime = true;
     if (firstTime)
     {
         firstTime = false;
 
-        // 清空旧节点
         ImGui::DockBuilderRemoveNode(dockspace_id);
         ImGui::DockBuilderAddNode(dockspace_id, dockFlags | ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->Size);
 
-        // 从左侧切一块 25% 宽度给 Controls + Histogram
         ImGuiID dock_main_id = dockspace_id;
+
+        // 左侧 25% → Controls + Histogram
         ImGuiID dock_left_id = ImGui::DockBuilderSplitNode(
-            dock_main_id,       // 要切割的节点
-            ImGuiDir_Left,      // 从左侧切
-            0.25f,              // 左侧占 25%
-            nullptr,            // 返回左节点
-            &dock_main_id       // 剩余的作为主区域
-        );
-        // 再把左侧上下分成 Controls（上）和 Histogram（下）
+            dock_main_id,
+            ImGuiDir_Left,
+            0.25f,
+            nullptr,
+            &dock_main_id);
+
         ImGuiID dock_left_bottom_id = ImGui::DockBuilderSplitNode(
             dock_left_id,
-            ImGuiDir_Down,      // 从下方切
-            0.4f,               // 下方占 40%，上方占 60%
+            ImGuiDir_Down,
+            0.40f,   // 下部 40% 给 Histogram
             nullptr,
-            &dock_left_id
-        );
-        // 此时：
-        // dock_left_id        = 左上（Controls）
-        // dock_left_bottom_id = 左下（Histogram）
-        // dock_main_id        = 中间（Image）
+            &dock_left_id);
 
-        // 把窗口 dock 到对应区域（名字要和 ImGui::Begin 的标题一致）
+        // 中间再切右 30% 给 Stack
+        ImGuiID dock_right_id = ImGui::DockBuilderSplitNode(
+            dock_main_id,
+            ImGuiDir_Right,
+            0.30f,
+            nullptr,
+            &dock_main_id);
+
+        // dock_left_id        -> Controls
+        // dock_left_bottom_id -> Histogram
+        // dock_main_id        -> Image
+        // dock_right_id       -> Stack
+
         ImGui::DockBuilderDockWindow("Controls",  dock_left_id);
         ImGui::DockBuilderDockWindow("Histogram", dock_left_bottom_id);
         ImGui::DockBuilderDockWindow("Image",     dock_main_id);
+        ImGui::DockBuilderDockWindow("Stack",     dock_right_id);
 
         ImGui::DockBuilderFinish(dockspace_id);
     }
@@ -219,14 +226,14 @@ void ImguiApp::render_ui()
     // ===== Controls 窗口 =====
     ImGui::Begin("Controls");
 
-    // 路径输入
+    // 路径输入 + Browse
     ImGui::InputText("FITS Path", &_currentPath);
-
-    // Browse 按钮单独一行
     if (ImGui::Button("Browse..."))
         open_file_dialog();
 
-    // Bayer
+    ImGui::Separator();
+
+    // Bayer 选择
     const char* patterns[] = {"None", "RGGB", "BGGR", "GRBG", "GBRG"};
     int bayerIndex = static_cast<int>(_bayer);
     bool bayerChanged = false;
@@ -237,7 +244,8 @@ void ImguiApp::render_ui()
         {
             _bayer = newB;
             bayerChanged = true;
-            _renderer.setBayerPattern(_bayer);
+            if (_hasImage)
+                _renderer.setBayerPattern(_bayer);
         }
     }
 
@@ -251,7 +259,8 @@ void ImguiApp::render_ui()
     if (stretchModeChanged)
     {
         _stretch.mode = static_cast<kty::StretchMode>(stretchIndex);
-        _renderer.setStretchParams(_stretch);
+        if (_hasImage)
+            _renderer.setStretchParams(_stretch);
     }
 
     // Auto Stretch 参数
@@ -284,7 +293,7 @@ void ImguiApp::render_ui()
 
     ImGui::Separator();
 
-    // 视图缩放
+    // 视图 Scale
     {
         float zoomMin = 0.1f, zoomMax = 20.0f;
         if (ImGui::SliderFloat("Scale", &_view.scale, zoomMin, zoomMax, "%.2f",
@@ -304,29 +313,22 @@ void ImguiApp::render_ui()
 
     ImGui::Separator();
 
-    // 白平衡
+    // 白平衡 + Auto WB
     bool wbChanged = false;
     if (ImGui::SliderFloat("R gain", &_wb.r, 0.1f, 4.0f)) wbChanged = true;
     if (ImGui::SliderFloat("G gain", &_wb.g, 0.1f, 4.0f)) wbChanged = true;
     if (ImGui::SliderFloat("B gain", &_wb.b, 0.1f, 4.0f)) wbChanged = true;
 
-    // ★ 新增：自动白平衡按钮
     if (ImGui::Button("Auto White Balance"))
     {
-        if (_hasImage)
+        if (_hasImage && _renderer.computeAutoWhiteBalance())
         {
-            if (_renderer.computeAutoWhiteBalance())
-            {
-                // 从 renderer 拿新的 wb
-                kty::WhiteBalance newWb = _renderer.whiteBalance();
-                _wb = newWb;
+            _wb = _renderer.whiteBalance();
 
-                // 自动白平衡会改变整体亮度分布，顺便重算 auto stretch + histogram
-                if (_renderer.recomputeAutoStretch())
-                {
-                    _histogram.clear();
-                    _renderer.getLumaHistogram(_histogram);
-                }
+            if (_renderer.recomputeAutoStretch())
+            {
+                _histogram.clear();
+                _renderer.getLumaHistogram(_histogram);
             }
         }
     }
@@ -411,7 +413,7 @@ void ImguiApp::render_ui()
     }
     ImGui::End();
 
-    // ===== Image 窗口：ImGui::Image 显示预览纹理 + 右键平移 =====
+    // ===== Image 窗口：预览纹理 + 右键平移 =====
     ImGuiWindowFlags imageFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
 
     if (ImGui::Begin("Image", nullptr, imageFlags))
@@ -424,23 +426,20 @@ void ImguiApp::render_ui()
 
             if (texW > 0 && texH > 0)
             {
-                ImGuiIO& io = ImGui::GetIO();
+                ImGuiIO& io2 = ImGui::GetIO();
 
                 // 在 Image 窗口内按住右键拖动，改变视图平移
                 if (ImGui::IsWindowHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Right))
                 {
-                    ImVec2 d = io.MouseDelta;
-                    // 把像素位移归一化到图像坐标（0~1），并且随缩放放大
+                    ImVec2 d = io2.MouseDelta;
                     float dx = -d.x / (float)texW;
                     float dy =  d.y / (float)texH;
                     _view.panX += dx * _view.scale;
                     _view.panY += dy * _view.scale;
                 }
 
-                // 更新核心视图参数
                 _renderer.setViewParams(_view);
 
-                // 让核心在 offscreen FBO 渲染一张预览纹理
                 if (_renderer.renderPreview(texW, texH))
                 {
                     unsigned int texId = _renderer.previewTextureId();
@@ -450,7 +449,7 @@ void ImguiApp::render_ui()
                             (ImTextureID)(intptr_t)texId,
                             ImVec2((float)texW, (float)texH),
                             ImVec2(0.0f, 1.0f),
-                            ImVec2(1.0f, 0.0f)   // 反转 Y，保持上下正确
+                            ImVec2(1.0f, 0.0f)
                         );
                     }
                 }
@@ -463,10 +462,224 @@ void ImguiApp::render_ui()
     }
     ImGui::End();
 
+    // ===== Stack 独立窗口 =====
+    render_stack_window();
 
     // ===== 文件对话框 =====
     if (_showFileDialog)
         render_file_dialog();
+}
+
+bool ImguiApp::loadCurrentFits()
+{
+    if (_currentPath.empty())
+        return false;
+
+    if (_renderer.loadFits(_currentPath, _bayer))
+    {
+        _hasImage = true;
+        _renderer.setStretchParams(_stretch);
+        _renderer.setWhiteBalance(_wb);
+
+        // 这里可以选择是否自动 WB；现在只保留手动按钮
+        // if (_renderer.computeAutoWhiteBalance())
+        //     _wb = _renderer.whiteBalance();
+
+        _renderer.recomputeAutoStretch();
+        _histogram.clear();
+        _renderer.getLumaHistogram(_histogram);
+
+        return true;
+    }
+
+    return false;
+}
+
+void ImguiApp::rebuildStackCoreFromUi()
+{
+    _stack.reset();
+
+    _stackLightCount = _stackDarkCount = _stackFlatCount = _stackBiasCount = 0;
+
+    for (const auto& item : _stackFiles)
+    {
+        _stack.addFrame(item.path, item.type);
+
+        switch (item.type)
+        {
+        case kty::FrameType::Light: _stackLightCount++; break;
+        case kty::FrameType::Dark:  _stackDarkCount++;  break;
+        case kty::FrameType::Flat:  _stackFlatCount++;  break;
+        case kty::FrameType::Bias:  _stackBiasCount++;  break;
+        }
+    }
+
+    if (_stackSelectedIndex >= (int)_stackFiles.size())
+        _stackSelectedIndex = (int)_stackFiles.size() - 1;
+}
+
+void ImguiApp::render_stack_window()
+{
+    ImGui::Begin("Stack");
+
+    // 当前文件信息
+    if (_currentPath.empty())
+    {
+        ImGui::TextUnformatted("请在 Controls 中选择 FITS 文件，或通过 Browse 打开。");
+    }
+    else
+    {
+        ImGui::Text("当前文件:");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "%s", _currentPath.c_str());
+    }
+
+    ImGui::Separator();
+
+    // 添加当前文件到 stack 列表
+    if (!_currentPath.empty())
+    {
+        if (ImGui::Button("Add as Light"))
+        {
+            _stackFiles.push_back({ _currentPath, kty::FrameType::Light });
+            rebuildStackCoreFromUi();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add as Dark"))
+        {
+            _stackFiles.push_back({ _currentPath, kty::FrameType::Dark });
+            rebuildStackCoreFromUi();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add as Flat"))
+        {
+            _stackFiles.push_back({ _currentPath, kty::FrameType::Flat });
+            rebuildStackCoreFromUi();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add as Bias"))
+        {
+            _stackFiles.push_back({ _currentPath, kty::FrameType::Bias });
+            rebuildStackCoreFromUi();
+        }
+    }
+    else
+    {
+        ImGui::TextDisabled("（当前路径为空，无法添加到 Light/Dark/Flat/Bias 列表）");
+    }
+
+    // 文件列表
+    ImGui::Separator();
+    ImGui::Text("待叠加文件列表：");
+    ImGui::Text("Lights: %d  Darks: %d  Flats: %d  Bias: %d",
+                _stackLightCount, _stackDarkCount, _stackFlatCount, _stackBiasCount);
+
+    ImGui::BeginChild("stack_file_list", ImVec2(0, 180), true);
+
+    for (int i = 0; i < (int)_stackFiles.size(); ++i)
+    {
+        const auto& item = _stackFiles[i];
+
+        const char* typeTag = "";
+        switch (item.type)
+        {
+        case kty::FrameType::Light: typeTag = "[L]"; break;
+        case kty::FrameType::Dark:  typeTag = "[D]"; break;
+        case kty::FrameType::Flat:  typeTag = "[F]"; break;
+        case kty::FrameType::Bias:  typeTag = "[B]"; break;
+        }
+
+        bool selected = (i == _stackSelectedIndex);
+        std::string label = std::string(typeTag) + " " + item.path;
+
+        if (ImGui::Selectable(label.c_str(), selected))
+        {
+            _stackSelectedIndex = i;
+        }
+    }
+
+    ImGui::EndChild();
+
+    // 删除 / 清空 按钮
+    if (ImGui::Button("Remove Selected"))
+    {
+        if (_stackSelectedIndex >= 0 && _stackSelectedIndex < (int)_stackFiles.size())
+        {
+            _stackFiles.erase(_stackFiles.begin() + _stackSelectedIndex);
+            _stackSelectedIndex = -1;
+            rebuildStackCoreFromUi();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear All"))
+    {
+        _stackFiles.clear();
+        _stackSelectedIndex = -1;
+        _stack.reset();
+        _stackLightCount = _stackDarkCount = _stackFlatCount = _stackBiasCount = 0;
+        // 日志保留或清空看你需求，这里保留
+    }
+
+    ImGui::Separator();
+
+    // 校准配置
+    kty::CalibConfig calibCfg = _stack.calibConfig();
+    ImGui::Checkbox("Use Bias", &calibCfg.useBias);
+    ImGui::Checkbox("Use Dark", &calibCfg.useDark);
+    ImGui::Checkbox("Use Flat", &calibCfg.useFlat);
+    _stack.setCalibConfig(calibCfg);
+
+    ImGui::Separator();
+
+    // 运行叠加 / 重置工程
+    if (ImGui::Button("Run Stack"))
+    {
+        _stackLog.clear();
+
+        if (!_stack.buildMasters())
+        {
+            _stackLog += "buildMasters failed.\n";
+        }
+        else
+        {
+            kty::StackResult res;
+            if (_stack.runStack(res))
+            {
+                _stackLog += res.log;
+
+                // TODO: 将来可以把 res.finalImage 喂给 FitsRenderer 做预览
+                // 比如新增 FitsRenderer::loadFromFitsImage(res.finalImage)
+            }
+            else
+            {
+                _stackLog += "runStack failed.\n";
+            }
+        }
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Reset Stack Project"))
+    {
+        _stackFiles.clear();
+        _stack.reset();
+        _stackLightCount = _stackDarkCount = _stackFlatCount = _stackBiasCount = 0;
+        _stackSelectedIndex = -1;
+        _stackLog.clear();
+    }
+
+    // Log 区域：始终显示
+    ImGui::Separator();
+    ImGui::TextUnformatted("Stack log:");
+    ImGui::BeginChild("stack_log_child", ImVec2(0, 180), true);
+
+    if (_stackLog.empty())
+        ImGui::TextDisabled("（尚无日志）");
+    else
+        ImGui::TextUnformatted(_stackLog.c_str());
+
+    ImGui::EndChild();
+
+    ImGui::End();
 }
 
 void ImguiApp::open_file_dialog()
@@ -493,6 +706,7 @@ void ImguiApp::open_file_dialog()
 
     _fileListDirty  = true;
     _showFileDialog = true;
+    _selectedFileIndex = -1;
 }
 
 void ImguiApp::refresh_file_list()
@@ -510,27 +724,6 @@ void ImguiApp::refresh_file_list()
         std::cerr << "refresh_file_list error: " << e.what() << "\n";
     }
     _fileListDirty = false;
-}
-
-bool ImguiApp::loadCurrentFits()
-{
-    if (_currentPath.empty())
-        return false;
-
-    if (_renderer.loadFits(_currentPath, _bayer))
-    {
-        _hasImage = true;
-        _renderer.setStretchParams(_stretch);
-        _renderer.setWhiteBalance(_wb);
-
-        _renderer.recomputeAutoStretch();
-        _histogram.clear();
-        _renderer.getLumaHistogram(_histogram);
-
-        return true;
-    }
-
-    return false;
 }
 
 void ImguiApp::render_file_dialog()
@@ -556,7 +749,7 @@ void ImguiApp::render_file_dialog()
             {
                 _fileDialogDir = p.parent_path().string();
                 _fileListDirty = true;
-                _selectedFileIndex = -1;   // ★ 重置选中
+                _selectedFileIndex = -1;
             }
         }
         catch (...) {}
@@ -575,8 +768,6 @@ void ImguiApp::render_file_dialog()
         try { isDir = fs::is_directory(p); } catch (...) {}
 
         bool selected = (i == _selectedFileIndex);
-
-        // 显示标签：[D] 目录名 / 文件名
         std::string label = isDir ? "[D] " + name : name;
 
         if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick))
@@ -600,9 +791,7 @@ void ImguiApp::render_file_dialog()
                 {
                     _currentPath = p.string();
                     if (loadCurrentFits())
-                    {
-                        _showFileDialog = false;  // 成功加载后关闭对话框
-                    }
+                        _showFileDialog = false;
                 }
             }
         }
@@ -612,19 +801,8 @@ void ImguiApp::render_file_dialog()
 
     if (ImGui::Button("Open"))
     {
-        if (!_currentPath.empty())
-        {
-            if (_renderer.loadFits(_currentPath, _bayer))
-            {
-                _hasImage = true;
-                _renderer.setStretchParams(_stretch);
-                _renderer.setWhiteBalance(_wb);
-                _renderer.recomputeAutoStretch();
-                _histogram.clear();
-                _renderer.getLumaHistogram(_histogram);
-            }
+        if (loadCurrentFits())
             _showFileDialog = false;
-        }
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel"))
