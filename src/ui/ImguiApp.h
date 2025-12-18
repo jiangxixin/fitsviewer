@@ -23,17 +23,27 @@ private:
     void render_ui();
     void render_file_dialog();
 
-    void open_file_dialog();
-    void refresh_file_list();
+    void open_file_dialog();     // Open "select folder" dialog
+    void refresh_file_list();    // Entries in file dialog (directories + files)
 
-    // 根据 _currentPath 加载 FITS 并更新 renderer 状态
+    // Load FITS from _currentPath and update renderer
     bool loadCurrentFits();
 
-    // 独立 Stack 窗口 UI
+    // Individual windows
     void render_stack_window();
+    void render_file_browse_window();
 
-    // 根据 UI 中的 stack 列表重建 StackCore 内部状态
+    // Rebuild StackCore from UI list
     void rebuildStackCoreFromUi();
+
+    // Folder mode: scan current folder for FITS files
+    void refreshDirFits();
+
+    // Load FITS at current index in _dirFits
+    bool loadDirFitsCurrent();
+
+    // Browse FITS in folder (delta = -1 / +1)
+    void browseDirFits(int delta);
 
 private:
     GLFWwindow* _window = nullptr;
@@ -41,7 +51,17 @@ private:
     kty::FitsRenderer _renderer;
     kty::StackCore    _stack;
 
+    // Currently displayed FITS full path
     std::string _currentPath;
+
+    // Current folder for browsing (File Browse window)
+    std::string _currentDir;
+
+    // FITS files in current directory (full paths)
+    std::vector<std::string> _dirFits;
+    int  _dirFitsIndex = -1;
+
+    // File dialog internal state
     std::string _fileDialogDir;
     std::vector<std::string> _fileEntries;
     bool _fileListDirty      = true;
@@ -60,7 +80,7 @@ private:
     bool        _exportJustSucceeded = false;
     std::string _lastExportPath;
 
-    // ===== StackCore 相关 UI 状态 =====
+    // ===== StackCore UI state =====
     struct StackFileItem {
         std::string    path;
         kty::FrameType type;

@@ -11,6 +11,7 @@
 
 #include <filesystem>
 #include <iostream>
+#include <algorithm>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -58,7 +59,7 @@ bool ImguiApp::init()
         return false;
     }
 
-    // ImGui 初始化 + Docking + 默认字体
+    // ImGui init + docking
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -69,7 +70,7 @@ bool ImguiApp::init()
     ImGui_ImplGlfw_InitForOpenGL(_window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    // 初始参数
+    // Initial parameters
     _stretch.autoStretch  = true;
     _stretch.blackClip    = 0.1f;
     _stretch.whiteClip    = 0.1f;
@@ -84,13 +85,19 @@ bool ImguiApp::init()
 
     try
     {
-        _fileDialogDir = fs::current_path().string();
+        _currentDir    = fs::current_path().string();
+        _fileDialogDir = _currentDir;
     }
     catch (...)
     {
+        _currentDir    = ".";
         _fileDialogDir = ".";
     }
     _fileListDirty = true;
+
+    // First scan of current folder
+    refreshDirFits();
+    loadDirFitsCurrent();
 
     return true;
 }
@@ -145,6 +152,91 @@ void ImguiApp::frame()
     glfwSwapBuffers(_window);
 }
 
+bool ImguiApp::loadCurrentFits()
+{
+    if (_currentPath.empty())
+        return false;
+
+    if (_renderer.loadFits(_currentPath, _bayer))
+    {
+        _hasImage = true;
+        _renderer.setStretchParams(_stretch);
+        _renderer.setWhiteBalance(_wb);
+
+        _renderer.recomputeAutoStretch();
+        _histogram.clear();
+        _renderer.getLumaHistogram(_histogram);
+
+        return true;
+    }
+
+    return false;
+}
+
+// Scan current folder for FITS files
+void ImguiApp::refreshDirFits()
+{
+    _dirFits.clear();
+    _dirFitsIndex = -1;
+
+    if (_currentDir.empty())
+        return;
+
+    try
+    {
+        for (auto& entry : fs::directory_iterator(_currentDir))
+        {
+            if (!entry.is_regular_file())
+                continue;
+
+            auto ext = entry.path().extension().string();
+            std::string extLower = ext;
+            std::transform(extLower.begin(), extLower.end(), extLower.begin(),
+                           [](unsigned char c){ return (char)std::tolower(c); });
+
+            if (extLower == ".fits" || extLower == ".fit" || extLower == ".fts")
+                _dirFits.push_back(entry.path().string());
+        }
+
+        std::sort(_dirFits.begin(), _dirFits.end());
+        if (!_dirFits.empty())
+            _dirFitsIndex = 0;
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "refreshDirFits error: " << e.what() << "\n";
+    }
+}
+
+bool ImguiApp::loadDirFitsCurrent()
+{
+    if (_dirFitsIndex < 0 || _dirFitsIndex >= (int)_dirFits.size())
+        return false;
+
+    _currentPath = _dirFits[_dirFitsIndex];
+    return loadCurrentFits();
+}
+
+void ImguiApp::browseDirFits(int delta)
+{
+    if (_dirFits.empty())
+        return;
+
+    int n = (int)_dirFits.size();
+    int idx = _dirFitsIndex;
+    if (idx < 0) idx = 0;
+
+    idx += delta;
+    if (idx < 0)  idx = 0;
+    if (idx >= n) idx = n - 1;
+
+    if (idx != _dirFitsIndex)
+    {
+        _dirFitsIndex = idx;
+        loadDirFitsCurrent();
+    }
+}
+
 void ImguiApp::render_ui()
 {
     ImGuiIO& io = ImGui::GetIO();
@@ -171,7 +263,7 @@ void ImguiApp::render_ui()
     ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
     ImGuiDockNodeFlags dockFlags = ImGuiDockNodeFlags_None;
 
-    // 一次性初始化 Dock 布局
+    // Build docking layout once
     static bool firstTime = true;
     if (firstTime)
     {
@@ -183,7 +275,7 @@ void ImguiApp::render_ui()
 
         ImGuiID dock_main_id = dockspace_id;
 
-        // 左侧 25% → Controls + Histogram
+        // Left 25% → File Browse + Histogram
         ImGuiID dock_left_id = ImGui::DockBuilderSplitNode(
             dock_main_id,
             ImGuiDir_Left,
@@ -194,11 +286,11 @@ void ImguiApp::render_ui()
         ImGuiID dock_left_bottom_id = ImGui::DockBuilderSplitNode(
             dock_left_id,
             ImGuiDir_Down,
-            0.40f,   // 下部 40% 给 Histogram
+            0.40f,
             nullptr,
             &dock_left_id);
 
-        // 中间再切右 30% 给 Stack
+        // Middle split right 30% for Controls + Stack
         ImGuiID dock_right_id = ImGui::DockBuilderSplitNode(
             dock_main_id,
             ImGuiDir_Right,
@@ -206,15 +298,16 @@ void ImguiApp::render_ui()
             nullptr,
             &dock_main_id);
 
-        // dock_left_id        -> Controls
+        // dock_left_id        -> File Browse
         // dock_left_bottom_id -> Histogram
         // dock_main_id        -> Image
-        // dock_right_id       -> Stack
+        // dock_right_id       -> Controls & Stack (tab)
 
-        ImGui::DockBuilderDockWindow("Controls",  dock_left_id);
-        ImGui::DockBuilderDockWindow("Histogram", dock_left_bottom_id);
-        ImGui::DockBuilderDockWindow("Image",     dock_main_id);
-        ImGui::DockBuilderDockWindow("Stack",     dock_right_id);
+        ImGui::DockBuilderDockWindow("File Browse", dock_left_id);
+        ImGui::DockBuilderDockWindow("Histogram",  dock_left_bottom_id);
+        ImGui::DockBuilderDockWindow("Image",      dock_main_id);
+        ImGui::DockBuilderDockWindow("Controls",   dock_right_id);
+        ImGui::DockBuilderDockWindow("Stack",      dock_right_id);
 
         ImGui::DockBuilderFinish(dockspace_id);
     }
@@ -223,17 +316,18 @@ void ImguiApp::render_ui()
 
     ImGui::End();
 
-    // ===== Controls 窗口 =====
+    // ===== Windows =====
+
+    // File browse (left, with file list + keyboard focus)
+    render_file_browse_window();
+
+    // Controls (right tab)
     ImGui::Begin("Controls");
 
-    // 路径输入 + Browse
-    ImGui::InputText("FITS Path", &_currentPath);
-    if (ImGui::Button("Browse..."))
-        open_file_dialog();
+    ImGui::TextUnformatted("Image Controls");
 
+    // Bayer selection
     ImGui::Separator();
-
-    // Bayer 选择
     const char* patterns[] = {"None", "RGGB", "BGGR", "GRBG", "GBRG"};
     int bayerIndex = static_cast<int>(_bayer);
     bool bayerChanged = false;
@@ -249,9 +343,8 @@ void ImguiApp::render_ui()
         }
     }
 
+    // Stretch
     ImGui::Separator();
-
-    // Stretch mode
     const char* stretchModes[] = {"Linear", "Arcsinh", "Log", "Sqrt"};
     int stretchIndex = static_cast<int>(_stretch.mode);
     bool stretchModeChanged = ImGui::Combo("Stretch mode", &stretchIndex,
@@ -263,7 +356,6 @@ void ImguiApp::render_ui()
             _renderer.setStretchParams(_stretch);
     }
 
-    // Auto Stretch 参数
     bool autoParamsChanged = false;
 
     if (ImGui::Checkbox("Auto Stretch", &_stretch.autoStretch))
@@ -291,9 +383,8 @@ void ImguiApp::render_ui()
         }
     }
 
+    // View scale
     ImGui::Separator();
-
-    // 视图 Scale
     {
         float zoomMin = 0.1f, zoomMax = 20.0f;
         if (ImGui::SliderFloat("Scale", &_view.scale, zoomMin, zoomMax, "%.2f",
@@ -311,9 +402,8 @@ void ImguiApp::render_ui()
         }
     }
 
+    // White balance
     ImGui::Separator();
-
-    // 白平衡 + Auto WB
     bool wbChanged = false;
     if (ImGui::SliderFloat("R gain", &_wb.r, 0.1f, 4.0f)) wbChanged = true;
     if (ImGui::SliderFloat("G gain", &_wb.g, 0.1f, 4.0f)) wbChanged = true;
@@ -343,9 +433,8 @@ void ImguiApp::render_ui()
         }
     }
 
+    // Export PNG
     ImGui::Separator();
-
-    // 导出 PNG
     if (ImGui::Button("Export PNG"))
     {
         _exportJustSucceeded = false;
@@ -387,12 +476,12 @@ void ImguiApp::render_ui()
     {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f),
-                           "导出成功: %s", _lastExportPath.c_str());
+                           "Exported: %s", _lastExportPath.c_str());
     }
 
     ImGui::End(); // Controls
 
-    // ===== Histogram 窗口 =====
+    // Histogram window
     if (ImGui::Begin("Histogram"))
     {
         if (!_histogram.empty())
@@ -413,7 +502,7 @@ void ImguiApp::render_ui()
     }
     ImGui::End();
 
-    // ===== Image 窗口：预览纹理 + 右键平移 =====
+    // Image window: preview texture + right-button pan
     ImGuiWindowFlags imageFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
 
     if (ImGui::Begin("Image", nullptr, imageFlags))
@@ -428,7 +517,6 @@ void ImguiApp::render_ui()
             {
                 ImGuiIO& io2 = ImGui::GetIO();
 
-                // 在 Image 窗口内按住右键拖动，改变视图平移
                 if (ImGui::IsWindowHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Right))
                 {
                     ImVec2 d = io2.MouseDelta;
@@ -462,37 +550,76 @@ void ImguiApp::render_ui()
     }
     ImGui::End();
 
-    // ===== Stack 独立窗口 =====
+    // Stack window (right tab)
     render_stack_window();
 
-    // ===== 文件对话框 =====
+    // Folder selection dialog
     if (_showFileDialog)
         render_file_dialog();
 }
 
-bool ImguiApp::loadCurrentFits()
+void ImguiApp::render_file_browse_window()
 {
-    if (_currentPath.empty())
-        return false;
+    ImGui::Begin("File Browse");
 
-    if (_renderer.loadFits(_currentPath, _bayer))
+    ImGui::TextUnformatted("Folder & FITS file list");
+
+    ImGui::Separator();
+    ImGui::InputText("Folder", &_currentDir, ImGuiInputTextFlags_ReadOnly);
+
+    if (ImGui::Button("Browse Folder..."))
+        open_file_dialog();
+    ImGui::SameLine();
+    if (ImGui::Button("Rescan") && !_currentDir.empty())
     {
-        _hasImage = true;
-        _renderer.setStretchParams(_stretch);
-        _renderer.setWhiteBalance(_wb);
-
-        // 这里可以选择是否自动 WB；现在只保留手动按钮
-        // if (_renderer.computeAutoWhiteBalance())
-        //     _wb = _renderer.whiteBalance();
-
-        _renderer.recomputeAutoStretch();
-        _histogram.clear();
-        _renderer.getLumaHistogram(_histogram);
-
-        return true;
+        refreshDirFits();
+        loadDirFitsCurrent();
     }
 
-    return false;
+    ImGui::Separator();
+    ImGui::Text("FITS files: %d", (int)_dirFits.size());
+
+    // File list with keyboard focus
+    ImGui::BeginChild("dir_fits_list", ImVec2(0, 0), true);
+
+    bool windowFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    if (windowFocused)
+    {
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+            browseDirFits(-1);
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+            browseDirFits(+1);
+    }
+
+    for (int i = 0; i < (int)_dirFits.size(); ++i)
+    {
+        fs::path p(_dirFits[i]);
+        std::string label = p.filename().string();
+        bool selected = (i == _dirFitsIndex);
+
+        if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick))
+        {
+            _dirFitsIndex = i;
+            loadDirFitsCurrent();
+        }
+
+        if (selected)
+            ImGui::SetItemDefaultFocus();
+    }
+
+    if (_dirFits.empty())
+    {
+        ImGui::TextDisabled("No FITS file in this folder.");
+    }
+    else
+    {
+        ImGui::Spacing();
+        ImGui::TextDisabled("Use Up/Down arrow keys to preview.");
+    }
+
+    ImGui::EndChild();
+
+    ImGui::End();
 }
 
 void ImguiApp::rebuildStackCoreFromUi()
@@ -522,21 +649,21 @@ void ImguiApp::render_stack_window()
 {
     ImGui::Begin("Stack");
 
-    // 当前文件信息
+    // Current file info
     if (_currentPath.empty())
     {
-        ImGui::TextUnformatted("请在 Controls 中选择 FITS 文件，或通过 Browse 打开。");
+        ImGui::TextUnformatted("No FITS loaded. Select a folder in 'File Browse'.");
     }
     else
     {
-        ImGui::Text("当前文件:");
+        ImGui::Text("Current file:");
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.8f, 0.9f, 1.0f, 1.0f), "%s", _currentPath.c_str());
+        ImGui::TextWrapped("%s", _currentPath.c_str());
     }
 
     ImGui::Separator();
 
-    // 添加当前文件到 stack 列表
+    // Add current file to stack lists
     if (!_currentPath.empty())
     {
         if (ImGui::Button("Add as Light"))
@@ -563,14 +690,10 @@ void ImguiApp::render_stack_window()
             rebuildStackCoreFromUi();
         }
     }
-    else
-    {
-        ImGui::TextDisabled("（当前路径为空，无法添加到 Light/Dark/Flat/Bias 列表）");
-    }
 
-    // 文件列表
+    // File list for stacking
     ImGui::Separator();
-    ImGui::Text("待叠加文件列表：");
+    ImGui::Text("Frames to stack:");
     ImGui::Text("Lights: %d  Darks: %d  Flats: %d  Bias: %d",
                 _stackLightCount, _stackDarkCount, _stackFlatCount, _stackBiasCount);
 
@@ -596,11 +719,19 @@ void ImguiApp::render_stack_window()
         {
             _stackSelectedIndex = i;
         }
+
+        if (selected)
+            ImGui::SetItemDefaultFocus();
+    }
+
+    if (_stackFiles.empty())
+    {
+        ImGui::TextDisabled("No frames added yet.");
     }
 
     ImGui::EndChild();
 
-    // 删除 / 清空 按钮
+    // Remove / clear
     if (ImGui::Button("Remove Selected"))
     {
         if (_stackSelectedIndex >= 0 && _stackSelectedIndex < (int)_stackFiles.size())
@@ -617,12 +748,12 @@ void ImguiApp::render_stack_window()
         _stackSelectedIndex = -1;
         _stack.reset();
         _stackLightCount = _stackDarkCount = _stackFlatCount = _stackBiasCount = 0;
-        // 日志保留或清空看你需求，这里保留
+        // keep log
     }
 
     ImGui::Separator();
 
-    // 校准配置
+    // Calibration config
     kty::CalibConfig calibCfg = _stack.calibConfig();
     ImGui::Checkbox("Use Bias", &calibCfg.useBias);
     ImGui::Checkbox("Use Dark", &calibCfg.useDark);
@@ -631,7 +762,7 @@ void ImguiApp::render_stack_window()
 
     ImGui::Separator();
 
-    // 运行叠加 / 重置工程
+    // Run / reset stack
     if (ImGui::Button("Run Stack"))
     {
         _stackLog.clear();
@@ -646,9 +777,7 @@ void ImguiApp::render_stack_window()
             if (_stack.runStack(res))
             {
                 _stackLog += res.log;
-
-                // TODO: 将来可以把 res.finalImage 喂给 FitsRenderer 做预览
-                // 比如新增 FitsRenderer::loadFromFitsImage(res.finalImage)
+                // TODO: later feed res.finalImage to FitsRenderer for preview
             }
             else
             {
@@ -667,13 +796,13 @@ void ImguiApp::render_stack_window()
         _stackLog.clear();
     }
 
-    // Log 区域：始终显示
+    // Log: always visible
     ImGui::Separator();
     ImGui::TextUnformatted("Stack log:");
     ImGui::BeginChild("stack_log_child", ImVec2(0, 180), true);
 
     if (_stackLog.empty())
-        ImGui::TextDisabled("（尚无日志）");
+        ImGui::TextDisabled("No log yet.");
     else
         ImGui::TextUnformatted(_stackLog.c_str());
 
@@ -684,20 +813,13 @@ void ImguiApp::render_stack_window()
 
 void ImguiApp::open_file_dialog()
 {
+    // Start from current folder
     try
     {
-        if (!_currentPath.empty())
-        {
-            fs::path p(_currentPath);
-            if (fs::is_directory(p))
-                _fileDialogDir = p.string();
-            else if (p.has_parent_path())
-                _fileDialogDir = p.parent_path().string();
-        }
+        if (!_currentDir.empty())
+            _fileDialogDir = _currentDir;
         else
-        {
             _fileDialogDir = fs::current_path().string();
-        }
     }
     catch (...)
     {
@@ -736,7 +858,7 @@ void ImguiApp::render_file_dialog()
                              ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(600, 400), ImVec2(FLT_MAX, FLT_MAX));
 
-    ImGui::Begin("Open FITS", &_showFileDialog);
+    ImGui::Begin("Select Folder", &_showFileDialog);
 
     ImGui::Text("Directory: %s", _fileDialogDir.c_str());
 
@@ -774,11 +896,6 @@ void ImguiApp::render_file_dialog()
         {
             _selectedFileIndex = i;
 
-            if (!isDir)
-            {
-                _currentPath = p.string();
-            }
-
             if (ImGui::IsMouseDoubleClicked(0))
             {
                 if (isDir)
@@ -787,22 +904,20 @@ void ImguiApp::render_file_dialog()
                     _fileListDirty = true;
                     _selectedFileIndex = -1;
                 }
-                else
-                {
-                    _currentPath = p.string();
-                    if (loadCurrentFits())
-                        _showFileDialog = false;
-                }
+                // double-click file: we ignore, only folder matters
             }
         }
     }
 
     ImGui::EndChild();
 
-    if (ImGui::Button("Open"))
+    // Use this folder
+    if (ImGui::Button("Use this folder"))
     {
-        if (loadCurrentFits())
-            _showFileDialog = false;
+        _currentDir = _fileDialogDir;
+        refreshDirFits();
+        loadDirFitsCurrent();
+        _showFileDialog = false;
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel"))
