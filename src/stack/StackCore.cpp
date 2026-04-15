@@ -2,10 +2,9 @@
 
 #include "FitsImage.h"
 
-#include <iostream>
-#include <sstream>
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 
 namespace kty {
 
@@ -42,9 +41,8 @@ bool StackCore::loadFrame(FrameEntry& entry)
         return true;
 
     auto img = std::make_unique<FitsImage>();
-    // 注意：这里直接用你已有的 load_fits(...) 函数
     FitsImage tmp;
-    if (!load_fits(entry.path, tmp, BayerPattern::NONE)) // 叠加一般用校准后的线性图，BayerPattern 可根据需求调整
+    if (!load_fits(entry.path, tmp, BayerPattern::NONE))
     {
         std::ostringstream oss;
         oss << "load_fits failed: " << entry.path << "\n";
@@ -54,6 +52,41 @@ bool StackCore::loadFrame(FrameEntry& entry)
 
     *img = std::move(tmp);
     entry.image = std::move(img);
+    return true;
+}
+
+bool StackCore::validateCompatible(const FitsImage& ref,
+                                   const FitsImage& other,
+                                   const std::string& what)
+{
+    if (ref.width != other.width || ref.height != other.height)
+    {
+        std::ostringstream oss;
+        oss << "Geometry mismatch in " << what
+            << ": ref=" << ref.width << "x" << ref.height
+            << ", got=" << other.width << "x" << other.height << "\n";
+        _log += oss.str();
+        return false;
+    }
+
+    if (ref.raw.size() != other.raw.size())
+    {
+        std::ostringstream oss;
+        oss << "Raw buffer mismatch in " << what
+            << ": ref=" << ref.raw.size()
+            << ", got=" << other.raw.size() << "\n";
+        _log += oss.str();
+        return false;
+    }
+
+    if (ref.raw.empty() || other.raw.empty())
+    {
+        std::ostringstream oss;
+        oss << "Empty raw buffer in " << what << "\n";
+        _log += oss.str();
+        return false;
+    }
+
     return true;
 }
 
@@ -78,35 +111,42 @@ bool StackCore::buildMasterBias()
     std::vector<const FitsImage*> biasFrames;
     for (auto& f : _frames)
     {
-        if (f.type == FrameType::Bias)
-        {
-            if (!loadFrame(f)) return false;
-            biasFrames.push_back(f.image.get());
-        }
+        if (f.type != FrameType::Bias)
+            continue;
+        if (!loadFrame(f))
+            return false;
+        biasFrames.push_back(f.image.get());
     }
 
     if (biasFrames.empty())
-        return false;
+    {
+        _log += "Skip Master Bias: no bias frames.\n";
+        return true;
+    }
 
-    // 简化：直接做逐像素中值
-    const int W = biasFrames[0]->width;
-    const int H = biasFrames[0]->height;
-    const size_t N = (size_t)W * H;
+    const FitsImage& ref = *biasFrames.front();
+    for (size_t i = 1; i < biasFrames.size(); ++i)
+    {
+        if (!validateCompatible(ref, *biasFrames[i], "bias frames"))
+            return false;
+    }
 
+    const size_t n = ref.raw.size();
     auto out = std::make_unique<FitsImage>();
-    out->width  = W;
-    out->height = H;
+    out->width = ref.width;
+    out->height = ref.height;
     out->channels = 1;
-    out->bayer    = biasFrames[0]->bayer;
-    out->raw.resize(N);
+    out->bayer = ref.bayer;
+    out->raw.resize(n);
 
     std::vector<double> tmp(biasFrames.size());
-    for (size_t idx = 0; idx < N; ++idx)
+    for (size_t idx = 0; idx < n; ++idx)
     {
         for (size_t i = 0; i < biasFrames.size(); ++i)
             tmp[i] = biasFrames[i]->raw[idx];
-        std::nth_element(tmp.begin(), tmp.begin() + tmp.size()/2, tmp.end());
-        out->raw[idx] = tmp[tmp.size()/2];
+
+        std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+        out->raw[idx] = tmp[tmp.size() / 2];
     }
 
     _masterBias = std::move(out);
@@ -119,36 +159,50 @@ bool StackCore::buildMasterDark()
     std::vector<const FitsImage*> darkFrames;
     for (auto& f : _frames)
     {
-        if (f.type == FrameType::Dark)
-        {
-            if (!loadFrame(f)) return false;
-            darkFrames.push_back(f.image.get());
-        }
+        if (f.type != FrameType::Dark)
+            continue;
+        if (!loadFrame(f))
+            return false;
+        darkFrames.push_back(f.image.get());
     }
 
     if (darkFrames.empty())
+    {
+        _log += "Skip Master Dark: no dark frames.\n";
+        return true;
+    }
+
+    const FitsImage& ref = *darkFrames.front();
+    for (size_t i = 1; i < darkFrames.size(); ++i)
+    {
+        if (!validateCompatible(ref, *darkFrames[i], "dark frames"))
+            return false;
+    }
+
+    if (_calibCfg.useBias && _masterBias && !validateCompatible(ref, *_masterBias, "dark vs master bias"))
         return false;
 
-    const int W = darkFrames[0]->width;
-    const int H = darkFrames[0]->height;
-    const size_t N = (size_t)W * H;
-
+    const size_t n = ref.raw.size();
     auto out = std::make_unique<FitsImage>();
-    out->width  = W;
-    out->height = H;
+    out->width = ref.width;
+    out->height = ref.height;
     out->channels = 1;
-    out->bayer    = darkFrames[0]->bayer;
-    out->raw.resize(N);
+    out->bayer = ref.bayer;
+    out->raw.resize(n);
 
     std::vector<double> tmp(darkFrames.size());
-    for (size_t idx = 0; idx < N; ++idx)
+    for (size_t idx = 0; idx < n; ++idx)
     {
         for (size_t i = 0; i < darkFrames.size(); ++i)
-            tmp[i] = darkFrames[i]->raw[idx];
+        {
+            double v = darkFrames[i]->raw[idx];
+            if (_calibCfg.useBias && _masterBias)
+                v -= _masterBias->raw[idx];
+            tmp[i] = v;
+        }
 
-        // TODO: 将来可以加 dark scaling，这里先直接中值
-        std::nth_element(tmp.begin(), tmp.begin() + tmp.size()/2, tmp.end());
-        out->raw[idx] = tmp[tmp.size()/2];
+        std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+        out->raw[idx] = tmp[tmp.size() / 2];
     }
 
     _masterDark = std::move(out);
@@ -161,47 +215,92 @@ bool StackCore::buildMasterFlat()
     std::vector<const FitsImage*> flatFrames;
     for (auto& f : _frames)
     {
-        if (f.type == FrameType::Flat)
-        {
-            if (!loadFrame(f)) return false;
-            flatFrames.push_back(f.image.get());
-        }
+        if (f.type != FrameType::Flat)
+            continue;
+        if (!loadFrame(f))
+            return false;
+        flatFrames.push_back(f.image.get());
     }
 
     if (flatFrames.empty())
-        return false;
-
-    const int W = flatFrames[0]->width;
-    const int H = flatFrames[0]->height;
-    const size_t N = (size_t)W * H;
-
-    auto out = std::make_unique<FitsImage>();
-    out->width  = W;
-    out->height = H;
-    out->channels = 1;
-    out->bayer    = flatFrames[0]->bayer;
-    out->raw.resize(N);
-
-    std::vector<double> tmp(flatFrames.size());
-
-    // 先做每个 flat 的 mean 归一化，然后再逐像素中值
-    // 简化起步：不减 bias/dark_flat，后面再加
-    for (size_t idx = 0; idx < N; ++idx)
     {
-        for (size_t i = 0; i < flatFrames.size(); ++i)
-            tmp[i] = flatFrames[i]->raw[idx];
-        std::nth_element(tmp.begin(), tmp.begin() + tmp.size()/2, tmp.end());
-        out->raw[idx] = tmp[tmp.size()/2];
+        _log += "Skip Master Flat: no flat frames.\n";
+        return true;
     }
 
-    // 归一化 MasterFlat，使 mean ≈ 1
-    double sum = 0.0;
-    for (size_t i = 0; i < N; ++i) sum += out->raw[i];
-    double mean = sum / (double)N;
-    if (mean != 0.0)
+    const FitsImage& ref = *flatFrames.front();
+    for (size_t i = 1; i < flatFrames.size(); ++i)
     {
-        for (size_t i = 0; i < N; ++i)
-            out->raw[i] /= mean;
+        if (!validateCompatible(ref, *flatFrames[i], "flat frames"))
+            return false;
+    }
+
+    if (_calibCfg.useBias && _masterBias && !validateCompatible(ref, *_masterBias, "flat vs master bias"))
+        return false;
+    if (_calibCfg.useDark && _masterDark && !validateCompatible(ref, *_masterDark, "flat vs master dark"))
+        return false;
+
+    const size_t n = ref.raw.size();
+    auto out = std::make_unique<FitsImage>();
+    out->width = ref.width;
+    out->height = ref.height;
+    out->channels = 1;
+    out->bayer = ref.bayer;
+    out->raw.resize(n);
+
+    std::vector<double> perFlatNorm(flatFrames.size(), 1.0);
+    for (size_t i = 0; i < flatFrames.size(); ++i)
+    {
+        double sum = 0.0;
+        for (size_t idx = 0; idx < n; ++idx)
+        {
+            double v = flatFrames[i]->raw[idx];
+            if (_calibCfg.useBias && _masterBias)
+                v -= _masterBias->raw[idx];
+            if (_calibCfg.useDark && _masterDark)
+                v -= _masterDark->raw[idx];
+            sum += v;
+        }
+
+        double mean = sum / static_cast<double>(n);
+        if (std::abs(mean) < 1e-12)
+        {
+            _log += "Flat frame mean is near zero; fallback normalization factor applied.\n";
+            mean = 1.0;
+        }
+        perFlatNorm[i] = mean;
+    }
+
+    std::vector<double> tmp(flatFrames.size());
+    for (size_t idx = 0; idx < n; ++idx)
+    {
+        for (size_t i = 0; i < flatFrames.size(); ++i)
+        {
+            double v = flatFrames[i]->raw[idx];
+            if (_calibCfg.useBias && _masterBias)
+                v -= _masterBias->raw[idx];
+            if (_calibCfg.useDark && _masterDark)
+                v -= _masterDark->raw[idx];
+            tmp[i] = v / perFlatNorm[i];
+        }
+
+        std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+        out->raw[idx] = tmp[tmp.size() / 2];
+    }
+
+    double sum = 0.0;
+    for (double v : out->raw)
+        sum += v;
+
+    double mean = sum / static_cast<double>(n);
+    if (std::abs(mean) < 1e-12)
+    {
+        _log += "Master Flat mean is near zero; skip final normalization.\n";
+    }
+    else
+    {
+        for (double& v : out->raw)
+            v /= mean;
     }
 
     _masterFlat = std::move(out);
@@ -211,27 +310,35 @@ bool StackCore::buildMasterFlat()
 
 bool StackCore::calibrateLight(const FitsImage& inLight, FitsImage& outCalib)
 {
-    const int W = inLight.width;
-    const int H = inLight.height;
-    const size_t N = (size_t)W * H;
+    if (inLight.raw.empty())
+    {
+        _log += "Light frame has empty raw buffer.\n";
+        return false;
+    }
 
-    outCalib = inLight; // 拷贝基础属性
-    outCalib.raw.resize(N);
+    if (_calibCfg.useBias && _masterBias && !validateCompatible(inLight, *_masterBias, "light vs master bias"))
+        return false;
+    if (_calibCfg.useDark && _masterDark && !validateCompatible(inLight, *_masterDark, "light vs master dark"))
+        return false;
+    if (_calibCfg.useFlat && _masterFlat && !validateCompatible(inLight, *_masterFlat, "light vs master flat"))
+        return false;
 
-    for (size_t idx = 0; idx < N; ++idx)
+    const size_t n = inLight.raw.size();
+    outCalib = inLight;
+    outCalib.raw.resize(n);
+
+    for (size_t idx = 0; idx < n; ++idx)
     {
         double v = inLight.raw[idx];
 
         if (_calibCfg.useBias && _masterBias)
             v -= _masterBias->raw[idx];
-
         if (_calibCfg.useDark && _masterDark)
-            v -= _masterDark->raw[idx];  // TODO: dark scaling
-
+            v -= _masterDark->raw[idx];
         if (_calibCfg.useFlat && _masterFlat)
         {
-            double flat = _masterFlat->raw[idx];
-            if (flat != 0.0)
+            const double flat = _masterFlat->raw[idx];
+            if (std::abs(flat) > 1e-12)
                 v /= flat;
         }
 
@@ -247,22 +354,25 @@ bool StackCore::combineLights(const std::vector<FitsImage>& calibratedLights,
     if (calibratedLights.empty())
         return false;
 
-    const int W = calibratedLights[0].width;
-    const int H = calibratedLights[0].height;
-    const size_t N = (size_t)W * H;
+    const FitsImage& ref = calibratedLights.front();
+    for (size_t i = 1; i < calibratedLights.size(); ++i)
+    {
+        if (!validateCompatible(ref, calibratedLights[i], "calibrated lights"))
+            return false;
+    }
 
-    outCombined = calibratedLights[0];
-    outCombined.raw.assign(N, 0.0);
+    const size_t n = ref.raw.size();
+    outCombined = ref;
+    outCombined.raw.assign(n, 0.0);
 
-    // 简化：均值叠加；后续可以根据 _rejCfg 实现 SigmaClip 等
     for (const auto& img : calibratedLights)
     {
-        for (size_t idx = 0; idx < N; ++idx)
+        for (size_t idx = 0; idx < n; ++idx)
             outCombined.raw[idx] += img.raw[idx];
     }
 
-    double inv = 1.0 / (double)calibratedLights.size();
-    for (size_t idx = 0; idx < N; ++idx)
+    const double inv = 1.0 / static_cast<double>(calibratedLights.size());
+    for (size_t idx = 0; idx < n; ++idx)
         outCombined.raw[idx] *= inv;
 
     return true;
@@ -270,16 +380,35 @@ bool StackCore::combineLights(const std::vector<FitsImage>& calibratedLights,
 
 bool StackCore::runStack(StackResult& outResult)
 {
-    // 1. 确保 master 都已生成
-    if (!buildMasters())
+    _log.clear();
+    outResult = StackResult{};
+
+    int totalLights = 0;
+    for (const auto& f : _frames)
     {
-        _log += "buildMasters failed.\n";
+        if (f.type == FrameType::Light)
+            ++totalLights;
+    }
+
+    if (totalLights == 0)
+    {
+        _log += "No light frames.\n";
+        outResult.log = _log;
         return false;
     }
 
-    // 2. 收集 Light 并逐张校准
+    if (!buildMasters())
+    {
+        _log += "buildMasters failed.\n";
+        outResult.log = _log;
+        return false;
+    }
+
     std::vector<FitsImage> calibratedLights;
+    calibratedLights.reserve(static_cast<size_t>(totalLights));
+
     int used = 0;
+    int rejected = 0;
 
     for (auto& f : _frames)
     {
@@ -287,11 +416,17 @@ bool StackCore::runStack(StackResult& outResult)
             continue;
 
         if (!loadFrame(f))
+        {
+            ++rejected;
             continue;
+        }
 
         FitsImage calib;
         if (!calibrateLight(*f.image, calib))
+        {
+            ++rejected;
             continue;
+        }
 
         calibratedLights.push_back(std::move(calib));
         ++used;
@@ -300,22 +435,28 @@ bool StackCore::runStack(StackResult& outResult)
     if (calibratedLights.empty())
     {
         _log += "No calibrated lights.\n";
+        outResult.log = _log;
+        outResult.rejectedLights = rejected;
         return false;
     }
 
-    // 3. 叠加
     FitsImage combined;
     if (!combineLights(calibratedLights, combined))
     {
         _log += "combineLights failed.\n";
+        outResult.log = _log;
+        outResult.rejectedLights = rejected;
         return false;
     }
 
-    outResult.finalImage   = std::move(combined);
-    outResult.usedLights   = used;
-    outResult.rejectedLights = 0; // TODO: 当实现拒绝算法时更新
-    outResult.log          = _log;
+    std::ostringstream oss;
+    oss << "Stack complete: used=" << used << ", rejected=" << rejected << "\n";
+    _log += oss.str();
 
+    outResult.finalImage = std::move(combined);
+    outResult.usedLights = used;
+    outResult.rejectedLights = rejected;
+    outResult.log = _log;
     return true;
 }
 

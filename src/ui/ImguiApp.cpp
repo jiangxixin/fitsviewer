@@ -12,11 +12,70 @@
 #include <filesystem>
 #include <iostream>
 #include <algorithm>
+#include <cctype>
+#include <vector>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 namespace fs = std::filesystem;
+
+static std::string path_to_utf8(const fs::path& p)
+{
+    return p.u8string();
+}
+
+static fs::path utf8_to_path(const std::string& s)
+{
+    return fs::u8path(s);
+}
+
+static bool setup_imgui_fonts()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+
+    // Prefer a CJK-capable font so UTF-8 Chinese filenames render correctly.
+    const ImWchar* glyphRanges = io.Fonts->GetGlyphRangesChineseFull();
+    ImFontConfig cfg;
+    cfg.OversampleH = 2;
+    cfg.OversampleV = 2;
+    cfg.PixelSnapH = false;
+
+    std::vector<fs::path> candidates;
+#if defined(__APPLE__)
+    candidates = {
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/Library/Fonts/Arial Unicode.ttf"
+    };
+#elif defined(_WIN32)
+    candidates = {
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc"
+    };
+#else
+    candidates = {
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
+    };
+#endif
+
+    for (const auto& p : candidates)
+    {
+        if (!fs::exists(p))
+            continue;
+        if (io.Fonts->AddFontFromFileTTF(path_to_utf8(p).c_str(), 13.0f, &cfg, glyphRanges))
+            return true;
+    }
+
+    io.Fonts->AddFontDefault();
+    return false;
+}
 
 ImguiApp::ImguiApp() {}
 ImguiApp::~ImguiApp()
@@ -50,12 +109,14 @@ bool ImguiApp::init()
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
     {
         std::cerr << "Failed to init GLAD\n";
+        shutdown();
         return false;
     }
 
     if (!_renderer.init())
     {
         std::cerr << "FitsRenderer init failed\n";
+        shutdown();
         return false;
     }
 
@@ -65,6 +126,8 @@ bool ImguiApp::init()
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    if (!setup_imgui_fonts())
+        std::cerr << "Warning: no CJK font found, Chinese text may render as garbled boxes.\n";
     ImGui::StyleColorsDark();
 
     ImGui_ImplGlfw_InitForOpenGL(_window, true);
@@ -85,7 +148,7 @@ bool ImguiApp::init()
 
     try
     {
-        _currentDir    = fs::current_path().string();
+        _currentDir    = path_to_utf8(fs::current_path());
         _fileDialogDir = _currentDir;
     }
     catch (...)
@@ -106,10 +169,12 @@ void ImguiApp::shutdown()
 {
     _renderer.shutdown();
 
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
     if (ImGui::GetCurrentContext())
+    {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
+    }
 
     if (_window)
     {
@@ -155,7 +220,11 @@ void ImguiApp::frame()
 bool ImguiApp::loadCurrentFits()
 {
     if (_currentPath.empty())
+    {
+        _hasImage = false;
+        _histogram.clear();
         return false;
+    }
 
     if (_renderer.loadFits(_currentPath, _bayer))
     {
@@ -170,6 +239,8 @@ bool ImguiApp::loadCurrentFits()
         return true;
     }
 
+    _hasImage = false;
+    _histogram.clear();
     return false;
 }
 
@@ -184,9 +255,13 @@ void ImguiApp::refreshDirFits()
 
     try
     {
-        for (auto& entry : fs::directory_iterator(_currentDir))
+        for (auto& entry : fs::directory_iterator(utf8_to_path(_currentDir)))
         {
             if (!entry.is_regular_file())
+                continue;
+
+            const std::string name = path_to_utf8(entry.path().filename());
+            if (!name.empty() && name[0] == '.')
                 continue;
 
             auto ext = entry.path().extension().string();
@@ -195,7 +270,7 @@ void ImguiApp::refreshDirFits()
                            [](unsigned char c){ return (char)std::tolower(c); });
 
             if (extLower == ".fits" || extLower == ".fit" || extLower == ".fts")
-                _dirFits.push_back(entry.path().string());
+                _dirFits.push_back(path_to_utf8(entry.path()));
         }
 
         std::sort(_dirFits.begin(), _dirFits.end());
@@ -440,7 +515,7 @@ void ImguiApp::render_ui()
         _exportJustSucceeded = false;
         if (_hasImage)
         {
-            fs::path inPath(_currentPath);
+            fs::path inPath = utf8_to_path(_currentPath);
             fs::path outPath;
             if (!inPath.empty())
             {
@@ -449,7 +524,7 @@ void ImguiApp::render_ui()
             }
             else
             {
-                outPath = fs::current_path() / "output.png";
+                outPath = fs::current_path() / fs::u8path("output.png");
             }
 
             std::vector<unsigned char> rgb;
@@ -457,10 +532,11 @@ void ImguiApp::render_ui()
             if (_renderer.renderToImage(rgb, w, h))
             {
                 int stride = w * 3;
-                if (stbi_write_png(outPath.string().c_str(), w, h, 3,
+                const std::string outPathUtf8 = path_to_utf8(outPath);
+                if (stbi_write_png(outPathUtf8.c_str(), w, h, 3,
                                    rgb.data(), stride))
                 {
-                    _lastExportPath = outPath.string();
+                    _lastExportPath = outPathUtf8;
                     _exportJustSucceeded = true;
                     std::cout << "PNG saved to " << _lastExportPath << "\n";
                 }
@@ -510,20 +586,38 @@ void ImguiApp::render_ui()
         if (_hasImage)
         {
             ImVec2 avail = ImGui::GetContentRegionAvail();
-            int texW = (int)avail.x;
-            int texH = (int)avail.y;
+            int texW = 0;
+            int texH = 0;
 
-            if (texW > 0 && texH > 0)
+            const float imgW = static_cast<float>(_renderer.width());
+            const float imgH = static_cast<float>(_renderer.height());
+            if (avail.x > 1.0f && avail.y > 1.0f && imgW > 1.0f && imgH > 1.0f)
             {
-                ImGuiIO& io2 = ImGui::GetIO();
+                float scale = std::min(avail.x / imgW, avail.y / imgH);
+                float drawW = imgW * scale;
+                float drawH = imgH * scale;
+                texW = std::max(1, (int)drawW);
+                texH = std::max(1, (int)drawH);
 
-                if (ImGui::IsWindowHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Right))
+                ImGuiIO& io2 = ImGui::GetIO();
+                const bool hovered = ImGui::IsWindowHovered();
+
+                if (hovered && io2.MouseWheel != 0.0f)
+                {
+                    const float factor = (io2.MouseWheel > 0.0f) ? 1.1f : (1.0f / 1.1f);
+                    _view.scale *= factor;
+                    if (_view.scale < 0.1f) _view.scale = 0.1f;
+                    if (_view.scale > 20.0f) _view.scale = 20.0f;
+                }
+
+                if (hovered && ImGui::IsMouseDown(ImGuiMouseButton_Right))
                 {
                     ImVec2 d = io2.MouseDelta;
                     float dx = -d.x / (float)texW;
                     float dy =  d.y / (float)texH;
-                    _view.panX += dx * _view.scale;
-                    _view.panY += dy * _view.scale;
+                    float zoom = (_view.scale > 0.1f) ? _view.scale : 0.1f;
+                    _view.panX += dx / zoom;
+                    _view.panY += dy / zoom;
                 }
 
                 _renderer.setViewParams(_view);
@@ -533,6 +627,10 @@ void ImguiApp::render_ui()
                     unsigned int texId = _renderer.previewTextureId();
                     if (texId != 0)
                     {
+                        ImVec2 pos = ImGui::GetCursorPos();
+                        pos.x += (avail.x - (float)texW) * 0.5f;
+                        pos.y += (avail.y - (float)texH) * 0.5f;
+                        ImGui::SetCursorPos(pos);
                         ImGui::Image(
                             (ImTextureID)(intptr_t)texId,
                             ImVec2((float)texW, (float)texH),
@@ -593,8 +691,8 @@ void ImguiApp::render_file_browse_window()
 
     for (int i = 0; i < (int)_dirFits.size(); ++i)
     {
-        fs::path p(_dirFits[i]);
-        std::string label = p.filename().string();
+        fs::path p = utf8_to_path(_dirFits[i]);
+        std::string label = path_to_utf8(p.filename());
         bool selected = (i == _dirFitsIndex);
 
         if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick))
@@ -767,22 +865,18 @@ void ImguiApp::render_stack_window()
     {
         _stackLog.clear();
 
-        if (!_stack.buildMasters())
+        kty::StackResult res;
+        if (_stack.runStack(res))
         {
-            _stackLog += "buildMasters failed.\n";
+            _stackLog += res.log;
+            // TODO: later feed res.finalImage to FitsRenderer for preview
         }
         else
         {
-            kty::StackResult res;
-            if (_stack.runStack(res))
-            {
+            if (!res.log.empty())
                 _stackLog += res.log;
-                // TODO: later feed res.finalImage to FitsRenderer for preview
-            }
             else
-            {
                 _stackLog += "runStack failed.\n";
-            }
         }
     }
 
@@ -819,7 +913,7 @@ void ImguiApp::open_file_dialog()
         if (!_currentDir.empty())
             _fileDialogDir = _currentDir;
         else
-            _fileDialogDir = fs::current_path().string();
+            _fileDialogDir = path_to_utf8(fs::current_path());
     }
     catch (...)
     {
@@ -836,8 +930,13 @@ void ImguiApp::refresh_file_list()
     _fileEntries.clear();
     try
     {
-        for (auto& entry : fs::directory_iterator(_fileDialogDir))
-            _fileEntries.push_back(entry.path().filename().string());
+        for (auto& entry : fs::directory_iterator(utf8_to_path(_fileDialogDir)))
+        {
+            const std::string name = path_to_utf8(entry.path().filename());
+            if (!name.empty() && name[0] == '.')
+                continue;
+            _fileEntries.push_back(name);
+        }
 
         std::sort(_fileEntries.begin(), _fileEntries.end());
     }
@@ -866,10 +965,10 @@ void ImguiApp::render_file_dialog()
     {
         try
         {
-            fs::path p(_fileDialogDir);
+            fs::path p = utf8_to_path(_fileDialogDir);
             if (p.has_parent_path())
             {
-                _fileDialogDir = p.parent_path().string();
+                _fileDialogDir = path_to_utf8(p.parent_path());
                 _fileListDirty = true;
                 _selectedFileIndex = -1;
             }
@@ -884,7 +983,7 @@ void ImguiApp::render_file_dialog()
     for (int i = 0; i < (int)_fileEntries.size(); ++i)
     {
         const std::string& name = _fileEntries[i];
-        fs::path p = fs::path(_fileDialogDir) / name;
+        fs::path p = utf8_to_path(_fileDialogDir) / utf8_to_path(name);
 
         bool isDir = false;
         try { isDir = fs::is_directory(p); } catch (...) {}
@@ -900,7 +999,7 @@ void ImguiApp::render_file_dialog()
             {
                 if (isDir)
                 {
-                    _fileDialogDir = p.string();
+                    _fileDialogDir = path_to_utf8(p);
                     _fileListDirty = true;
                     _selectedFileIndex = -1;
                 }

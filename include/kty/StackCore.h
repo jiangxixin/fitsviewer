@@ -100,6 +100,9 @@ private:
     bool buildMasterBias();
     bool buildMasterDark();
     bool buildMasterFlat();
+    bool validateCompatible(const FitsImage& ref,
+                            const FitsImage& other,
+                            const std::string& what);
 
     bool calibrateLight(const FitsImage& inLight, FitsImage& outCalib);
     bool combineLights(const std::vector<FitsImage>& calibratedLights,

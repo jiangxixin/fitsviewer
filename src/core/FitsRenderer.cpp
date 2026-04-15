@@ -75,8 +75,17 @@ bool FitsRenderer::loadFits(const std::string& path, BayerPattern bayerHint)
     _hasImage  = !asFits(_fits)->raw.empty();
     _bayer     = bayerHint;
 
-    if (!_hasImage)
+    const size_t expectedPixels = static_cast<size_t>(_imgWidth) * static_cast<size_t>(_imgHeight);
+    if (!_hasImage || asFits(_fits)->channels != 1 || asFits(_fits)->raw.size() != expectedPixels)
+    {
+        if (asFits(_fits)->channels != 1)
+            std::cerr << "Unsupported FITS channels for renderer: " << asFits(_fits)->channels << "\n";
+        if (asFits(_fits)->raw.size() != expectedPixels)
+            std::cerr << "Unsupported FITS buffer size for renderer: got " << asFits(_fits)->raw.size()
+                      << ", expected " << expectedPixels << "\n";
+        _hasImage = false;
         return false;
+    }
 
     _view.scale = 1.0f;
     _view.panX  = 0.0f;

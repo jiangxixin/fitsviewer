@@ -717,13 +717,37 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
     float oldWbR       = _wbR;
     float oldWbG       = _wbG;
     float oldWbB       = _wbB;
+    float oldZoom      = _zoom;
+    float oldPanX      = _panX;
+    float oldPanY      = _panY;
+
+    auto restorePreviewState = [&]() {
+        _zoom = oldZoom;
+        _panX = oldPanX;
+        _panY = oldPanY;
+    };
+
+    auto restoreAllState = [&]() {
+        _wbR = oldWbR;
+        _wbG = oldWbG;
+        _wbB = oldWbB;
+        _useAuto = oldUseAuto;
+        _autoLow = oldLow;
+        _autoHigh = oldHigh;
+        _stretchStrength = oldStrength;
+        restorePreviewState();
+        setWhiteBalance(_wbR, _wbG, _wbB);
+        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+    };
 
     // 临时设置白平衡为 1,1,1，关闭 AutoStretch，保持线性
     _wbR = _wbG = _wbB = 1.0f;
     _useAuto = false;
     _autoLow = 0.0f;
     _autoHigh = 1.0f;
-    // _stretchStrength 无所谓，反正 uUseAuto = false
+    _zoom = 1.0f;
+    _panX = 0.0f;
+    _panY = 0.0f;
     setWhiteBalance(_wbR, _wbG, _wbB);
     setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
 
@@ -731,22 +755,14 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
     const int S = 256;  // 统计用预览尺寸
     if (!renderPreview(S, S))
     {
-        // 还原状态
-        _wbR = oldWbR; _wbG = oldWbG; _wbB = oldWbB;
-        _useAuto = oldUseAuto; _autoLow = oldLow; _autoHigh = oldHigh;
-        setWhiteBalance(_wbR, _wbG, _wbB);
-        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+        restoreAllState();
         return false;
     }
 
     // 从预览 FBO 读回图像
     if (!_previewFBO || !_previewTex)
     {
-        // 还原状态
-        _wbR = oldWbR; _wbG = oldWbG; _wbB = oldWbB;
-        _useAuto = oldUseAuto; _autoLow = oldLow; _autoHigh = oldHigh;
-        setWhiteBalance(_wbR, _wbG, _wbB);
-        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+        restoreAllState();
         return false;
     }
 
@@ -794,11 +810,7 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
 
     if (count == 0)
     {
-        // 没有合适采样点，恢复状态
-        _wbR = oldWbR; _wbG = oldWbG; _wbB = oldWbB;
-        _useAuto = oldUseAuto; _autoLow = oldLow; _autoHigh = oldHigh;
-        setWhiteBalance(_wbR, _wbG, _wbB);
-        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+        restoreAllState();
         return false;
     }
 
@@ -808,10 +820,7 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
 
     if (meanR <= 0.0 || meanG <= 0.0 || meanB <= 0.0)
     {
-        _wbR = oldWbR; _wbG = oldWbG; _wbB = oldWbB;
-        _useAuto = oldUseAuto; _autoLow = oldLow; _autoHigh = oldHigh;
-        setWhiteBalance(_wbR, _wbG, _wbB);
-        setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
+        restoreAllState();
         return false;
     }
 
@@ -831,13 +840,13 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
     gG = clampGain(gG);
     gB = clampGain(gB);
 
-    // ==== 4. 把计算结果写回，并恢复 AutoStretch 状态 ====
+    // ==== 4. 把计算结果写回，并恢复 AutoStretch/视图状态 ====
     _wbR = gR;
     _wbG = gG;
     _wbB = gB;
     setWhiteBalance(_wbR, _wbG, _wbB);
 
-    // 恢复 AutoStretch/low/high，但不覆盖新的白平衡
+    restorePreviewState();
     _useAuto         = oldUseAuto;
     _autoLow         = oldLow;
     _autoHigh        = oldHigh;
