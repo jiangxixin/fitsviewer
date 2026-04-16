@@ -959,7 +959,7 @@ bool GlImageRenderer::computeWhiteBalanceGpuImpl(float& outGainR,
     setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
 
     // ==== 2. 用小尺寸预览渲染一张 RGB 图（GPU debayer 完成） ====
-    const int S = 256;  // 统计用预览尺寸
+    const int S = 128;  // 统计用预览尺寸，降低 readback 与 CPU 统计开销
     if (!renderPreview(S, S))
     {
         restoreAllState();

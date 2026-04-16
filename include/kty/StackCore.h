@@ -15,24 +15,51 @@ enum class FrameType {
     Bias
 };
 
+enum class BackgroundCalibrationMode {
+    None,
+    PerChannel,
+    RgbChannels
+};
+
+enum class FrameSelectionMode {
+    ManualKeepPercent,
+    AutoStarQuality
+};
+
+enum class AutoQualityProfile {
+    Conservative,
+    Balanced,
+    Aggressive
+};
+
 struct CalibConfig {
     bool useBias  = true;
     bool useDark  = true;
+    bool optimizeDark = true;
     bool useFlat  = true;
+    bool removeHotPixels = true;
+    bool removeLineDefects = true;
+    BackgroundCalibrationMode backgroundCalibration = BackgroundCalibrationMode::PerChannel;
+    bool qualityWeighting = true;
+    FrameSelectionMode frameSelectionMode = FrameSelectionMode::AutoStarQuality;
+    AutoQualityProfile autoQualityProfile = AutoQualityProfile::Balanced;
+    float keepBestPercent = 100.0f;
 
     // 未来可以加：dark scaling / exposure 比例 / 温度匹配之类
 };
 
 struct RejectConfig {
-    // 参考 PixInsight/Siril 的像素拒绝思路，默认启用 SigmaClip
+    // 参考 DSS/PixInsight/Siril 的像素拒绝思路，默认启用 DSS 的自适应加权平均
     enum class Method {
         None,
-        SigmaClip
+        SigmaClip,
+        AutoAdaptiveWeightedAverage
     };
-    Method method      = Method::SigmaClip;
+    Method method      = Method::AutoAdaptiveWeightedAverage;
     float sigmaLow     = 3.0f;
     float sigmaHigh    = 3.0f;
     int   minSamples   = 3;
+    int   iterations   = 5;
 };
 
 struct DenoiseConfig {
@@ -55,6 +82,8 @@ struct DenoiseConfig {
 
 struct StackResult {
     FitsImage finalImage;           // 叠加结果（float、RGB 或单通道）
+    std::vector<float> coverageMap; // 0~1，有效覆盖权重占比
+    std::vector<float> effectiveSamplesMap; // Kish effective sample count
     std::string log;                // 处理日志（后面给 UI 用）
     int usedLights     = 0;
     int rejectedLights = 0;
@@ -81,10 +110,12 @@ public:
     void setCalibConfig(const CalibConfig& cfg)   { _calibCfg = cfg; }
     void setRejectConfig(const RejectConfig& cfg) { _rejCfg   = cfg; }
     void setDenoiseConfig(const DenoiseConfig& cfg) { _denoiseCfg = cfg; }
+    void setBayerPattern(::BayerPattern pattern) { _bayerPattern = pattern; }
 
     const CalibConfig&  calibConfig()  const { return _calibCfg;  }
     const RejectConfig& rejectConfig() const { return _rejCfg;   }
     const DenoiseConfig& denoiseConfig() const { return _denoiseCfg; }
+    ::BayerPattern bayerPattern() const { return _bayerPattern; }
 
     // 预处理：生成 MasterBias / MasterDark / MasterFlat
     bool buildMasters();
@@ -96,6 +127,8 @@ public:
     const FitsImage* masterBias() const { return _masterBias.get(); }
     const FitsImage* masterDark() const { return _masterDark.get(); }
     const FitsImage* masterFlat() const { return _masterFlat.get(); }
+    const std::vector<float>& coverageMap() const { return _coverageMap; }
+    const std::vector<float>& effectiveSamplesMap() const { return _effectiveSamplesMap; }
 
     // 简单日志访问
     const std::string& log() const { return _log; }
@@ -116,6 +149,11 @@ private:
     std::unique_ptr<FitsImage> _masterBias;
     std::unique_ptr<FitsImage> _masterDark;
     std::unique_ptr<FitsImage> _masterFlat;
+    std::vector<uint8_t> _hotPixelMap;
+    std::vector<uint8_t> _lineDefectMap;
+    std::vector<float> _coverageMap;
+    std::vector<float> _effectiveSamplesMap;
+    ::BayerPattern _bayerPattern = ::BayerPattern::NONE;
 
     std::string _log;
 

@@ -597,13 +597,22 @@ bool ImguiApp::saveSessionState()
     const kty::CalibConfig calibCfg = _stack.calibConfig();
     data.useBias = calibCfg.useBias;
     data.useDark = calibCfg.useDark;
+    data.optimizeDark = calibCfg.optimizeDark;
     data.useFlat = calibCfg.useFlat;
+    data.removeHotPixels = calibCfg.removeHotPixels;
+    data.removeLineDefects = calibCfg.removeLineDefects;
+    data.backgroundCalibrationMode = static_cast<int>(calibCfg.backgroundCalibration);
+    data.qualityWeighting = calibCfg.qualityWeighting;
+    data.frameSelectionMode = static_cast<int>(calibCfg.frameSelectionMode);
+    data.autoQualityProfile = static_cast<int>(calibCfg.autoQualityProfile);
+    data.keepBestPercent = calibCfg.keepBestPercent;
 
     const kty::RejectConfig rejectCfg = _stack.rejectConfig();
     data.rejectMethod = static_cast<int>(rejectCfg.method);
     data.sigmaLow = rejectCfg.sigmaLow;
     data.sigmaHigh = rejectCfg.sigmaHigh;
     data.minSamples = rejectCfg.minSamples;
+    data.rejectIterations = rejectCfg.iterations;
 
     const kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
     data.denoisePreviewMode = static_cast<int>(denoiseCfg.previewMode);
@@ -652,14 +661,26 @@ void ImguiApp::loadSessionState()
     kty::CalibConfig calibCfg = _stack.calibConfig();
     calibCfg.useBias = data.useBias;
     calibCfg.useDark = data.useDark;
+    calibCfg.optimizeDark = data.optimizeDark;
     calibCfg.useFlat = data.useFlat;
+    calibCfg.removeHotPixels = data.removeHotPixels;
+    calibCfg.removeLineDefects = data.removeLineDefects;
+    calibCfg.backgroundCalibration = static_cast<kty::BackgroundCalibrationMode>(
+        std::clamp(data.backgroundCalibrationMode, 0, 2));
+    calibCfg.qualityWeighting = data.qualityWeighting;
+    calibCfg.frameSelectionMode = static_cast<kty::FrameSelectionMode>(
+        std::clamp(data.frameSelectionMode, 0, 1));
+    calibCfg.autoQualityProfile = static_cast<kty::AutoQualityProfile>(
+        std::clamp(data.autoQualityProfile, 0, 2));
+    calibCfg.keepBestPercent = std::clamp(data.keepBestPercent, 5.0f, 100.0f);
     _stack.setCalibConfig(calibCfg);
 
     kty::RejectConfig rejectCfg = _stack.rejectConfig();
-    rejectCfg.method = static_cast<kty::RejectConfig::Method>(std::clamp(data.rejectMethod, 0, 1));
+    rejectCfg.method = static_cast<kty::RejectConfig::Method>(std::clamp(data.rejectMethod, 0, 2));
     rejectCfg.sigmaLow = data.sigmaLow;
     rejectCfg.sigmaHigh = data.sigmaHigh;
     rejectCfg.minSamples = data.minSamples;
+    rejectCfg.iterations = std::clamp(data.rejectIterations, 1, 8);
     _stack.setRejectConfig(rejectCfg);
 
     kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
@@ -706,6 +727,7 @@ void ImguiApp::startStackJob()
     const kty::CalibConfig calibCfg = _stack.calibConfig();
     const kty::RejectConfig rejectCfg = _stack.rejectConfig();
     const kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
+    const ::BayerPattern bayerPattern = static_cast<::BayerPattern>(_bayer);
 
     {
         std::lock_guard<std::mutex> lock(_stackJob.mutex);
@@ -718,11 +740,12 @@ void ImguiApp::startStackJob()
         _stackJob.result = kty::StackResult{};
     }
 
-    _stackJob.worker = std::thread([this, stackFiles, calibCfg, rejectCfg, denoiseCfg]() {
+    _stackJob.worker = std::thread([this, stackFiles, calibCfg, rejectCfg, denoiseCfg, bayerPattern]() {
         kty::StackCore workerStack;
         workerStack.setCalibConfig(calibCfg);
         workerStack.setRejectConfig(rejectCfg);
         workerStack.setDenoiseConfig(denoiseCfg);
+        workerStack.setBayerPattern(bayerPattern);
         for (const auto& item : stackFiles)
             workerStack.addFrame(item.path, item.type);
 
@@ -799,7 +822,7 @@ void ImguiApp::pollBackgroundJobs()
             if (_renderer.loadMonochromeImage(stackResult.finalImage.raw,
                                               stackResult.finalImage.width,
                                               stackResult.finalImage.height,
-                                              _bayer))
+                                              static_cast<kty::BayerPattern>(stackResult.finalImage.bayer)))
             {
                 _hasImage = true;
                 _showingStackResult = true;
@@ -861,7 +884,7 @@ void ImguiApp::render_ui()
 
         ImGuiID dock_main_id = dockspace_id;
 
-        // Left 25% → File Browse + Histogram
+        // Left 25% → File Browse + Inspector
         ImGuiID dock_left_id = ImGui::DockBuilderSplitNode(
             dock_main_id,
             ImGuiDir_Left,
@@ -876,7 +899,7 @@ void ImguiApp::render_ui()
             nullptr,
             &dock_left_id);
 
-        // Middle split right 30% for Controls + Stack
+        // Middle split right 30% for Stack
         ImGuiID dock_right_id = ImGui::DockBuilderSplitNode(
             dock_main_id,
             ImGuiDir_Right,
@@ -885,14 +908,13 @@ void ImguiApp::render_ui()
             &dock_main_id);
 
         // dock_left_id        -> File Browse
-        // dock_left_bottom_id -> Histogram
+        // dock_left_bottom_id -> Inspector
         // dock_main_id        -> Image
-        // dock_right_id       -> Controls & Stack (tab)
+        // dock_right_id       -> Stack
 
         ImGui::DockBuilderDockWindow("File Browse", dock_left_id);
-        ImGui::DockBuilderDockWindow("Histogram",  dock_left_bottom_id);
+        ImGui::DockBuilderDockWindow("Inspector",  dock_left_bottom_id);
         ImGui::DockBuilderDockWindow("Image",      dock_main_id);
-        ImGui::DockBuilderDockWindow("Controls",   dock_right_id);
         ImGui::DockBuilderDockWindow("Stack",      dock_right_id);
 
         ImGui::DockBuilderFinish(dockspace_id);
@@ -906,201 +928,7 @@ void ImguiApp::render_ui()
 
     // File browse (left, with file list + keyboard focus)
     render_file_browse_window();
-
-    // Controls (right tab)
-    ImGui::Begin("Controls");
-
-    ImGui::TextUnformatted("Image Controls");
-    ImGui::SameLine();
-    if (ImGui::Button("Reset Controls"))
-        resetControlParams();
-
-    // Bayer selection
-    ImGui::Separator();
-    const char* patterns[] = {"None", "RGGB", "BGGR", "GRBG", "GBRG"};
-    int bayerIndex = static_cast<int>(_bayer);
-    bool refreshHistogram = false;
-    if (ImGui::Combo("Bayer", &bayerIndex, patterns, IM_ARRAYSIZE(patterns)))
-    {
-        kty::BayerPattern newB = static_cast<kty::BayerPattern>(bayerIndex);
-        if (newB != _bayer)
-        {
-            _bayer = newB;
-            if (_hasImage)
-            {
-                _renderer.setBayerPattern(_bayer);
-                refreshHistogram = true;
-            }
-        }
-    }
-
-    // Stretch
-    ImGui::Separator();
-    const char* stretchModes[] = {"Linear", "Arcsinh", "Log", "Sqrt"};
-    int stretchIndex = static_cast<int>(_stretch.mode);
-    bool stretchModeChanged = ImGui::Combo("Stretch mode", &stretchIndex,
-                                           stretchModes, IM_ARRAYSIZE(stretchModes));
-    if (stretchModeChanged)
-    {
-        _stretch.mode = static_cast<kty::StretchMode>(stretchIndex);
-        if (_hasImage)
-        {
-            _renderer.setStretchParams(_stretch);
-            refreshHistogram = true;
-        }
-    }
-
-    if (ImGui::Checkbox("Auto Stretch", &_stretch.autoStretch))
-    {
-        if (_hasImage)
-        {
-            _renderer.setStretchParams(_stretch);
-            refreshHistogram = true;
-        }
-    }
-
-    bool stretchSliderCommitted = false;
-
-    ImGui::SliderFloat("Black clip %", &_stretch.blackClip, 0.0f, 20.0f);
-    stretchSliderCommitted |= ImGui::IsItemDeactivatedAfterEdit();
-
-    ImGui::SliderFloat("White clip %", &_stretch.whiteClip, 0.0f, 20.0f);
-    stretchSliderCommitted |= ImGui::IsItemDeactivatedAfterEdit();
-
-    ImGui::SliderFloat("Stretch strength", &_stretch.strength, 1.0f, 20.0f);
-    stretchSliderCommitted |= ImGui::IsItemDeactivatedAfterEdit();
-
-    if (stretchSliderCommitted && _hasImage)
-    {
-        _renderer.setStretchParams(_stretch);
-        refreshHistogram = true;
-    }
-
-    // View scale
-    ImGui::Separator();
-    {
-        float zoomMin = 0.1f, zoomMax = 20.0f;
-        if (ImGui::SliderFloat("Scale", &_view.scale, zoomMin, zoomMax, "%.2f",
-                               ImGuiSliderFlags_Logarithmic))
-        {
-            if (_view.scale < zoomMin) _view.scale = zoomMin;
-            if (_view.scale > zoomMax) _view.scale = zoomMax;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Reset View"))
-        {
-            _view.scale = 1.0f;
-            _view.panX  = 0.0f;
-            _view.panY  = 0.0f;
-        }
-    }
-
-    // White balance
-    ImGui::Separator();
-    bool wbCommitted = false;
-    ImGui::SliderFloat("R gain", &_wb.r, 0.1f, 4.0f);
-    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
-    ImGui::SliderFloat("G gain", &_wb.g, 0.1f, 4.0f);
-    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
-    ImGui::SliderFloat("B gain", &_wb.b, 0.1f, 4.0f);
-    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
-
-    if (ImGui::Button("Auto White Balance"))
-    {
-        if (_hasImage && _renderer.computeAutoWhiteBalance())
-        {
-            _wb = _renderer.whiteBalance();
-            refreshHistogram = true;
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Background Neutralization"))
-    {
-        if (_hasImage && _renderer.computeBackgroundNeutralization())
-        {
-            _wb = _renderer.whiteBalance();
-            refreshHistogram = true;
-        }
-    }
-
-    if (wbCommitted && _hasImage)
-    {
-        _renderer.setWhiteBalance(_wb);
-        refreshHistogram = true;
-    }
-
-    if (refreshHistogram)
-        refreshRendererHistogram();
-
-    // Export PNG
-    ImGui::Separator();
-    if (ImGui::Button("Export PNG"))
-    {
-        _exportJustSucceeded = false;
-        if (_hasImage)
-        {
-            fs::path inPath = utf8_to_path(_currentPath);
-            fs::path outPath;
-            if (!inPath.empty())
-            {
-                outPath = inPath;
-                outPath.replace_extension(".png");
-            }
-            else
-            {
-                outPath = fs::current_path() / fs::u8path("output.png");
-            }
-
-            std::vector<unsigned char> rgb;
-            int w = 0, h = 0;
-            if (_renderer.renderToImage(rgb, w, h))
-            {
-                int stride = w * 3;
-                const std::string outPathUtf8 = path_to_utf8(outPath);
-                if (stbi_write_png(outPathUtf8.c_str(), w, h, 3,
-                                   rgb.data(), stride))
-                {
-                    _lastExportPath = outPathUtf8;
-                    _exportJustSucceeded = true;
-                    std::cout << "PNG saved to " << _lastExportPath << "\n";
-                }
-                else
-                {
-                    std::cerr << "Failed to write png: " << outPath << "\n";
-                }
-            }
-        }
-    }
-
-    if (_exportJustSucceeded && !_lastExportPath.empty())
-    {
-        ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f),
-                           "Exported: %s", _lastExportPath.c_str());
-    }
-
-    ImGui::End(); // Controls
-
-    // Histogram window
-    if (ImGui::Begin("Histogram"))
-    {
-        if (!_histogram.empty())
-        {
-            ImGui::PlotHistogram("Luma",
-                                 _histogram.data(),
-                                 (int)_histogram.size(),
-                                 0,
-                                 nullptr,
-                                 0.0f,
-                                 1.0f,
-                                 ImVec2(0, 120));
-        }
-        else
-        {
-            ImGui::TextUnformatted("No histogram yet.");
-        }
-    }
-    ImGui::End();
+    render_inspector_window();
 
     // Image window: preview texture + right-button pan
     ImGuiWindowFlags imageFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
@@ -1171,13 +999,279 @@ void ImguiApp::render_ui()
         }
     }
     ImGui::End();
-
     // Stack window (right tab)
     render_stack_window();
 
     // Folder selection dialog
     if (_showFileDialog)
         render_file_dialog();
+}
+
+void ImguiApp::render_inspector_window()
+{
+    if (!ImGui::Begin("Inspector"))
+    {
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::BeginTabBar("InspectorTabs"))
+    {
+        if (ImGui::BeginTabItem("Histogram"))
+        {
+            if (!_histogram.empty())
+            {
+                ImGui::PlotHistogram("Luma",
+                                     _histogram.data(),
+                                     (int)_histogram.size(),
+                                     0,
+                                     nullptr,
+                                     0.0f,
+                                     1.0f,
+                                     ImVec2(0, 140));
+            }
+            else
+            {
+                ImGui::TextUnformatted("No histogram yet.");
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("Histogram refreshes after drag release; preview stays GPU-live while adjusting.");
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Controls"))
+        {
+            render_controls_panel();
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
+
+    ImGui::End();
+}
+
+void ImguiApp::render_controls_panel()
+{
+    const double now = ImGui::GetTime();
+    constexpr double kInteractiveAutoStretchIntervalSec = 1.0 / 24.0;
+
+    ImGui::TextUnformatted("Image Controls");
+    ImGui::SameLine();
+    if (ImGui::Button("Reset Controls"))
+        resetControlParams();
+
+    bool refreshHistogram = false;
+
+    ImGui::Separator();
+    const char* patterns[] = {"None", "RGGB", "BGGR", "GRBG", "GBRG"};
+    int bayerIndex = static_cast<int>(_bayer);
+    if (ImGui::Combo("Bayer", &bayerIndex, patterns, IM_ARRAYSIZE(patterns)))
+    {
+        kty::BayerPattern newB = static_cast<kty::BayerPattern>(bayerIndex);
+        if (newB != _bayer)
+        {
+            _bayer = newB;
+            if (_hasImage)
+            {
+                _renderer.setBayerPattern(_bayer);
+                refreshHistogram = true;
+            }
+        }
+    }
+
+    ImGui::Separator();
+    const char* stretchModes[] = {"Linear", "Arcsinh", "Log", "Sqrt"};
+    int stretchIndex = static_cast<int>(_stretch.mode);
+    if (ImGui::Combo("Stretch mode", &stretchIndex, stretchModes, IM_ARRAYSIZE(stretchModes)))
+    {
+        _stretch.mode = static_cast<kty::StretchMode>(stretchIndex);
+        if (_hasImage)
+        {
+            _renderer.setStretchParams(_stretch);
+            if (_stretch.autoStretch)
+                _renderer.recomputeAutoStretch();
+            refreshHistogram = true;
+        }
+    }
+
+    if (ImGui::Checkbox("Auto Stretch", &_stretch.autoStretch))
+    {
+        if (_hasImage)
+        {
+            _renderer.setStretchParams(_stretch);
+            if (_stretch.autoStretch)
+                _renderer.recomputeAutoStretch();
+            refreshHistogram = true;
+        }
+    }
+
+    bool stretchChanged = false;
+    bool stretchCommitted = false;
+    bool clipChanged = false;
+    bool clipActive = false;
+
+    clipChanged |= ImGui::SliderFloat("Black clip %", &_stretch.blackClip, 0.0f, 20.0f,
+                                      "%.4f", ImGuiSliderFlags_AlwaysClamp);
+    stretchChanged |= clipChanged;
+    clipActive |= ImGui::IsItemActive();
+    stretchCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+
+    bool whiteClipChanged = ImGui::SliderFloat("White clip %", &_stretch.whiteClip, 0.0f, 20.0f,
+                                               "%.4f", ImGuiSliderFlags_AlwaysClamp);
+    clipChanged |= whiteClipChanged;
+    stretchChanged |= whiteClipChanged;
+    clipActive |= ImGui::IsItemActive();
+    stretchCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+
+    const bool strengthChanged = ImGui::SliderFloat("Stretch strength", &_stretch.strength, 1.0f, 20.0f,
+                                                    "%.4f", ImGuiSliderFlags_AlwaysClamp);
+    stretchChanged |= strengthChanged;
+    stretchCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+
+    if ((stretchChanged || stretchCommitted) && _hasImage)
+    {
+        _renderer.setStretchParams(_stretch);
+        const bool shouldRecomputeAutoStretch = _stretch.autoStretch && clipChanged;
+        if (shouldRecomputeAutoStretch)
+        {
+            const bool throttledInteractiveUpdate =
+                clipActive &&
+                (now - _lastInteractiveAutoStretchUpdate) >= kInteractiveAutoStretchIntervalSec;
+            if (!clipActive || stretchCommitted || throttledInteractiveUpdate)
+            {
+                _renderer.recomputeAutoStretch();
+                _lastInteractiveAutoStretchUpdate = now;
+            }
+        }
+        if (stretchCommitted)
+            refreshHistogram = true;
+    }
+    ImGui::Separator();
+    const float zoomMin = 0.1f;
+    const float zoomMax = 20.0f;
+    if (ImGui::SliderFloat("Scale", &_view.scale, zoomMin, zoomMax, "%.4f",
+                           ImGuiSliderFlags_Logarithmic))
+    {
+        _view.scale = std::clamp(_view.scale, zoomMin, zoomMax);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset View"))
+    {
+        _view.scale = 1.0f;
+        _view.panX  = 0.0f;
+        _view.panY  = 0.0f;
+    }
+
+    ImGui::Separator();
+    bool wbChanged = false;
+    bool wbCommitted = false;
+
+    wbChanged |= ImGui::SliderFloat("R gain", &_wb.r, 0.1f, 4.0f,
+                                    "%.4f", ImGuiSliderFlags_AlwaysClamp);
+    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+
+    wbChanged |= ImGui::SliderFloat("G gain", &_wb.g, 0.1f, 4.0f,
+                                    "%.4f", ImGuiSliderFlags_AlwaysClamp);
+    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+
+    wbChanged |= ImGui::SliderFloat("B gain", &_wb.b, 0.1f, 4.0f,
+                                    "%.4f", ImGuiSliderFlags_AlwaysClamp);
+    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+
+    if ((wbChanged || wbCommitted) && _hasImage)
+    {
+        _renderer.setWhiteBalance(_wb);
+        if (wbCommitted)
+            refreshHistogram = true;
+    }
+    if (ImGui::Button("Auto White Balance"))
+    {
+        if (_hasImage && _renderer.computeAutoWhiteBalance())
+        {
+            _wb = _renderer.whiteBalance();
+            refreshHistogram = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Background Neutralization"))
+    {
+        if (_hasImage && _renderer.computeBackgroundNeutralization())
+        {
+            _wb = _renderer.whiteBalance();
+            refreshHistogram = true;
+        }
+    }
+
+    if (refreshHistogram)
+        refreshRendererHistogram();
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Export PNG matches the current OpenGL render.");
+    auto export_png = [&](bool hqExport) {
+        _exportJustSucceeded = false;
+        if (!_hasImage)
+            return;
+
+        fs::path inPath = utf8_to_path(_currentPath);
+        fs::path outPath;
+        if (!inPath.empty())
+        {
+            outPath = inPath;
+            if (hqExport)
+            {
+                outPath.replace_extension();
+                outPath += "_hq.png";
+            }
+            else
+            {
+                outPath.replace_extension(".png");
+            }
+        }
+        else
+        {
+            outPath = fs::current_path() / fs::u8path(hqExport ? "output_hq.png" : "output.png");
+        }
+
+        std::vector<unsigned char> rgb;
+        int w = 0, h = 0;
+        const bool ok = hqExport ? _renderer.renderHqToImage(rgb, w, h)
+                                 : _renderer.renderToImage(rgb, w, h);
+        if (!ok)
+            return;
+
+        const int stride = w * 3;
+        const std::string outPathUtf8 = path_to_utf8(outPath);
+        if (stbi_write_png(outPathUtf8.c_str(), w, h, 3, rgb.data(), stride))
+        {
+            _lastExportPath = outPathUtf8;
+            _exportJustSucceeded = true;
+            std::cout << "PNG saved to " << _lastExportPath << "\n";
+        }
+        else
+        {
+            std::cerr << "Failed to write png: " << outPath << "\n";
+        }
+    };
+
+    if (ImGui::Button("Export PNG"))
+        export_png(false);
+
+    const kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
+    if (denoiseCfg.exportMode != kty::DenoiseConfig::ExportMode::Off)
+    {
+        ImGui::SameLine();
+        if (ImGui::Button("Export HQ PNG"))
+            export_png(true);
+    }
+
+    if (_exportJustSucceeded && !_lastExportPath.empty())
+    {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f),
+                           "Exported: %s", _lastExportPath.c_str());
+    }
 }
 
 void ImguiApp::render_file_browse_window()
@@ -1516,12 +1610,36 @@ void ImguiApp::render_stack_window()
     kty::CalibConfig calibCfg = _stack.calibConfig();
     ImGui::Checkbox("Use Bias", &calibCfg.useBias);
     ImGui::Checkbox("Use Dark", &calibCfg.useDark);
+    ImGui::Checkbox("Dark Optimization", &calibCfg.optimizeDark);
     ImGui::Checkbox("Use Flat", &calibCfg.useFlat);
+    ImGui::Checkbox("Hot Pixel Correction", &calibCfg.removeHotPixels);
+    ImGui::Checkbox("Bad Column/Row Correction", &calibCfg.removeLineDefects);
+    const char* backgroundModes[] = {"Off", "Per Channel", "RGB Channels"};
+    int backgroundMode = static_cast<int>(calibCfg.backgroundCalibration);
+    if (ImGui::Combo("Background Calibration", &backgroundMode, backgroundModes, IM_ARRAYSIZE(backgroundModes)))
+        calibCfg.backgroundCalibration = static_cast<kty::BackgroundCalibrationMode>(backgroundMode);
+    ImGui::Checkbox("Quality Weighting", &calibCfg.qualityWeighting);
+    const char* selectionModes[] = {"Manual Keep %", "Auto Star Quality"};
+    int frameSelectionMode = static_cast<int>(calibCfg.frameSelectionMode);
+    if (ImGui::Combo("Frame Selection", &frameSelectionMode, selectionModes, IM_ARRAYSIZE(selectionModes)))
+        calibCfg.frameSelectionMode = static_cast<kty::FrameSelectionMode>(frameSelectionMode);
+    if (calibCfg.frameSelectionMode == kty::FrameSelectionMode::AutoStarQuality)
+    {
+        const char* qualityProfiles[] = {"Conservative", "Balanced", "Aggressive"};
+        int autoQualityProfile = static_cast<int>(calibCfg.autoQualityProfile);
+        if (ImGui::Combo("Selection Profile", &autoQualityProfile, qualityProfiles, IM_ARRAYSIZE(qualityProfiles)))
+            calibCfg.autoQualityProfile = static_cast<kty::AutoQualityProfile>(autoQualityProfile);
+        ImGui::TextDisabled("Uses star count, FWHM, roundness and SNR to choose a keep ratio.");
+    }
+    else
+    {
+        ImGui::SliderFloat("Keep Best %", &calibCfg.keepBestPercent, 5.0f, 100.0f, "%.1f");
+    }
     _stack.setCalibConfig(calibCfg);
 
     ImGui::Separator();
     kty::RejectConfig rejectCfg = _stack.rejectConfig();
-    const char* rejectMethods[] = {"None", "Sigma Clip"};
+    const char* rejectMethods[] = {"None", "Sigma Clip", "Auto Adaptive Weighted Average"};
     int rejectMethod = static_cast<int>(rejectCfg.method);
     if (ImGui::Combo("Rejection", &rejectMethod, rejectMethods, IM_ARRAYSIZE(rejectMethods)))
         rejectCfg.method = static_cast<kty::RejectConfig::Method>(rejectMethod);
@@ -1530,6 +1648,13 @@ void ImguiApp::render_stack_window()
         ImGui::SliderFloat("Low Sigma", &rejectCfg.sigmaLow, 1.5f, 5.0f, "%.2f");
         ImGui::SliderFloat("High Sigma", &rejectCfg.sigmaHigh, 1.5f, 5.0f, "%.2f");
         ImGui::SliderInt("Min Samples", &rejectCfg.minSamples, 3, 20);
+        ImGui::SliderInt("Iterations", &rejectCfg.iterations, 1, 8);
+    }
+    else if (rejectCfg.method == kty::RejectConfig::Method::AutoAdaptiveWeightedAverage)
+    {
+        ImGui::SliderInt("Min Samples", &rejectCfg.minSamples, 3, 20);
+        ImGui::SliderInt("Iterations", &rejectCfg.iterations, 1, 8);
+        ImGui::TextDisabled("DSS-style: soft down-weighting instead of hard rejection.");
     }
     _stack.setRejectConfig(rejectCfg);
 

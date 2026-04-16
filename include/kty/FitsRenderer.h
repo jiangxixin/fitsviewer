@@ -72,6 +72,7 @@ public:
     void render(int viewportWidth, int viewportHeight);
 
     bool renderToImage(std::vector<unsigned char>& outRGB, int& outWidth, int& outHeight) const;
+    bool renderHqToImage(std::vector<unsigned char>& outRGB, int& outWidth, int& outHeight) const;
 
     // 预览纹理
     bool renderPreview(int width, int height);

@@ -140,11 +140,25 @@ bool AppSessionStore::load(const std::string& dbPath,
         else if (key == "bayer") outData.bayer = to_int(value, outData.bayer);
         else if (key == "use_bias") outData.useBias = to_bool(value, outData.useBias);
         else if (key == "use_dark") outData.useDark = to_bool(value, outData.useDark);
+        else if (key == "optimize_dark") outData.optimizeDark = to_bool(value, outData.optimizeDark);
         else if (key == "use_flat") outData.useFlat = to_bool(value, outData.useFlat);
+        else if (key == "remove_hot_pixels") outData.removeHotPixels = to_bool(value, outData.removeHotPixels);
+        else if (key == "remove_line_defects") outData.removeLineDefects = to_bool(value, outData.removeLineDefects);
+        else if (key == "background_calibration_mode")
+            outData.backgroundCalibrationMode = to_int(value, outData.backgroundCalibrationMode);
+        else if (key == "quality_weighting")
+            outData.qualityWeighting = to_bool(value, outData.qualityWeighting);
+        else if (key == "frame_selection_mode")
+            outData.frameSelectionMode = to_int(value, outData.frameSelectionMode);
+        else if (key == "auto_quality_profile")
+            outData.autoQualityProfile = to_int(value, outData.autoQualityProfile);
+        else if (key == "keep_best_percent")
+            outData.keepBestPercent = to_float(value, outData.keepBestPercent);
         else if (key == "reject_method") outData.rejectMethod = to_int(value, outData.rejectMethod);
         else if (key == "sigma_low") outData.sigmaLow = to_float(value, outData.sigmaLow);
         else if (key == "sigma_high") outData.sigmaHigh = to_float(value, outData.sigmaHigh);
         else if (key == "min_samples") outData.minSamples = to_int(value, outData.minSamples);
+        else if (key == "reject_iterations") outData.rejectIterations = to_int(value, outData.rejectIterations);
         else if (key == "denoise_enabled")
             outData.denoisePreviewMode = to_bool(value, true) ? 1 : 0;
         else if (key == "denoise_preview_mode")
@@ -210,11 +224,20 @@ bool AppSessionStore::save(const std::string& dbPath,
          set_kv(db, "bayer", std::to_string(data.bayer), errorMessage) &&
          set_kv(db, "use_bias", data.useBias ? "1" : "0", errorMessage) &&
          set_kv(db, "use_dark", data.useDark ? "1" : "0", errorMessage) &&
+         set_kv(db, "optimize_dark", data.optimizeDark ? "1" : "0", errorMessage) &&
          set_kv(db, "use_flat", data.useFlat ? "1" : "0", errorMessage) &&
+         set_kv(db, "remove_hot_pixels", data.removeHotPixels ? "1" : "0", errorMessage) &&
+         set_kv(db, "remove_line_defects", data.removeLineDefects ? "1" : "0", errorMessage) &&
+         set_kv(db, "background_calibration_mode", std::to_string(data.backgroundCalibrationMode), errorMessage) &&
+         set_kv(db, "quality_weighting", data.qualityWeighting ? "1" : "0", errorMessage) &&
+         set_kv(db, "frame_selection_mode", std::to_string(data.frameSelectionMode), errorMessage) &&
+         set_kv(db, "auto_quality_profile", std::to_string(data.autoQualityProfile), errorMessage) &&
+         set_kv(db, "keep_best_percent", std::to_string(data.keepBestPercent), errorMessage) &&
          set_kv(db, "reject_method", std::to_string(data.rejectMethod), errorMessage) &&
          set_kv(db, "sigma_low", std::to_string(data.sigmaLow), errorMessage) &&
          set_kv(db, "sigma_high", std::to_string(data.sigmaHigh), errorMessage) &&
          set_kv(db, "min_samples", std::to_string(data.minSamples), errorMessage) &&
+         set_kv(db, "reject_iterations", std::to_string(data.rejectIterations), errorMessage) &&
          set_kv(db, "denoise_enabled", data.denoisePreviewMode != 0 ? "1" : "0", errorMessage) &&
          set_kv(db, "denoise_preview_mode", std::to_string(data.denoisePreviewMode), errorMessage) &&
          set_kv(db, "denoise_export_mode", std::to_string(data.denoiseExportMode), errorMessage) &&

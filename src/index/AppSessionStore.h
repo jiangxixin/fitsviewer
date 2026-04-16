@@ -17,12 +17,21 @@ struct AppSessionData {
 
     bool useBias = true;
     bool useDark = true;
+    bool optimizeDark = true;
     bool useFlat = true;
+    bool removeHotPixels = true;
+    bool removeLineDefects = true;
+    int backgroundCalibrationMode = 1;
+    bool qualityWeighting = true;
+    int frameSelectionMode = 1;
+    int autoQualityProfile = 1;
+    float keepBestPercent = 100.0f;
 
-    int rejectMethod = 1;
+    int rejectMethod = 2;
     float sigmaLow = 3.0f;
     float sigmaHigh = 3.0f;
     int minSamples = 3;
+    int rejectIterations = 5;
 
     int denoisePreviewMode = 1;
     int denoiseExportMode = 1;

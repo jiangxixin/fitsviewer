@@ -639,71 +639,6 @@ static void downsample_linear_rgb_2x(const std::vector<float>& src,
     }
 }
 
-static bool compute_histogram_from_linear_rgb(const std::vector<float>& linearRgb,
-                                              int width,
-                                              int height,
-                                              const StretchParams& stretch,
-                                              float autoLow,
-                                              float autoHigh,
-                                              std::vector<float>& outHist)
-{
-    if (width <= 0 || height <= 0 || linearRgb.empty())
-        return false;
-
-    constexpr int histBins = 64;
-    std::vector<float> lum = compute_luminance(linearRgb, width, height);
-    outHist.assign(histBins, 0.0f);
-
-    const float range = std::max(autoHigh - autoLow, 1.0e-3f);
-    const float s = std::max(stretch.strength, 1.0f);
-    const float asinhDenom = std::max(std::asinh(s), 1.0e-6f);
-    const float logDenom = std::max(std::log(1.0f + s), 1.0e-6f);
-
-    for (float v : lum)
-    {
-        float y = v;
-        if (stretch.autoStretch)
-        {
-            const float t = clamp01f((v - autoLow) / range);
-            switch (stretch.mode)
-            {
-                case StretchMode::Linear:
-                    y = t;
-                    break;
-                case StretchMode::Asinh:
-                    y = clamp01f(std::asinh(s * t) / asinhDenom);
-                    break;
-                case StretchMode::Log:
-                    y = clamp01f(std::log(1.0f + s * t) / logDenom);
-                    break;
-                case StretchMode::Sqrt:
-                    y = std::sqrt(t);
-                    break;
-            }
-        }
-        else
-        {
-            y = clamp01f(v);
-        }
-        int bin = static_cast<int>(y * histBins);
-        bin = std::clamp(bin, 0, histBins - 1);
-        outHist[static_cast<size_t>(bin)] += 1.0f;
-    }
-
-    float maxCount = 0.0f;
-    for (float c : outHist)
-        maxCount = std::max(maxCount, c);
-    if (maxCount > 0.0f)
-    {
-        for (float& c : outHist)
-        {
-            c /= maxCount;
-            c = std::sqrt(c);
-        }
-    }
-    return true;
-}
-
 static void apply_cpu_stretch(std::vector<float>& rgb,
                               const StretchParams& stretch,
                               float autoLow,
@@ -792,122 +727,6 @@ static bool build_hq_linear_rgb(const FitsImage& source,
     }
 
     apply_luminance_ratio(outLinearRgb, originalLum, lum, starMask);
-    return true;
-}
-
-static std::array<float, 3> sample_bilinear_rgb(const std::vector<float>& rgb,
-                                                int width,
-                                                int height,
-                                                float u,
-                                                float v)
-{
-    const float x = std::clamp(u, 0.0f, 1.0f) * static_cast<float>(width - 1);
-    const float y = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(height - 1);
-    const int x0 = std::clamp(static_cast<int>(std::floor(x)), 0, width - 1);
-    const int y0 = std::clamp(static_cast<int>(std::floor(y)), 0, height - 1);
-    const int x1 = std::clamp(x0 + 1, 0, width - 1);
-    const int y1 = std::clamp(y0 + 1, 0, height - 1);
-    const float tx = x - static_cast<float>(x0);
-    const float ty = y - static_cast<float>(y0);
-
-    std::array<float, 3> color = {0.0f, 0.0f, 0.0f};
-    for (int c = 0; c < 3; ++c)
-    {
-        const float c00 = rgb[(static_cast<size_t>(y0) * width + x0) * 3 + c];
-        const float c10 = rgb[(static_cast<size_t>(y0) * width + x1) * 3 + c];
-        const float c01 = rgb[(static_cast<size_t>(y1) * width + x0) * 3 + c];
-        const float c11 = rgb[(static_cast<size_t>(y1) * width + x1) * 3 + c];
-        const float top = c00 * (1.0f - tx) + c10 * tx;
-        const float bottom = c01 * (1.0f - tx) + c11 * tx;
-        color[static_cast<size_t>(c)] = top * (1.0f - ty) + bottom * ty;
-    }
-    return color;
-}
-
-static bool render_rgb_view_to_u8(const std::vector<float>& linearRgb,
-                                  int sourceWidth,
-                                  int sourceHeight,
-                                  const StretchParams& stretch,
-                                  float autoLow,
-                                  float autoHigh,
-                                  const ViewParams& view,
-                                  int viewportWidth,
-                                  int viewportHeight,
-                                  std::vector<unsigned char>& outRgb)
-{
-    if (sourceWidth <= 0 || sourceHeight <= 0 || viewportWidth <= 0 || viewportHeight <= 0)
-        return false;
-
-    const float texAspect = static_cast<float>(sourceWidth) / static_cast<float>(sourceHeight);
-    const float screenAspect = static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight);
-    const float range = std::max(autoHigh - autoLow, 1.0e-3f);
-    const float s = std::max(stretch.strength, 1.0f);
-    const float asinhDenom = std::max(std::asinh(s), 1.0e-6f);
-    const float logDenom = std::max(std::log(1.0f + s), 1.0e-6f);
-
-    outRgb.assign(static_cast<size_t>(viewportWidth) * viewportHeight * 3, 0);
-    for (int y = 0; y < viewportHeight; ++y)
-    {
-        for (int x = 0; x < viewportWidth; ++x)
-        {
-            float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(viewportWidth);
-            float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(viewportHeight);
-
-            if (screenAspect > texAspect)
-            {
-                const float scale = texAspect / screenAspect;
-                const float mappedX = (u - 0.5f) * scale + 0.5f;
-                if (mappedX < 0.0f || mappedX > 1.0f)
-                    continue;
-                u = mappedX;
-            }
-            else
-            {
-                const float scale = screenAspect / texAspect;
-                const float mappedY = (v - 0.5f) * scale + 0.5f;
-                if (mappedY < 0.0f || mappedY > 1.0f)
-                    continue;
-                v = mappedY;
-            }
-
-            u = ((u - 0.5f) / std::max(view.scale, 0.1f)) + 0.5f + view.panX;
-            v = ((v - 0.5f) / std::max(view.scale, 0.1f)) + 0.5f + view.panY;
-            if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
-                continue;
-
-            auto color = sample_bilinear_rgb(linearRgb, sourceWidth, sourceHeight, u, v);
-            for (float& channel : color)
-            {
-                float out = channel;
-                if (stretch.autoStretch)
-                {
-                    const float t = clamp01f((channel - autoLow) / range);
-                    switch (stretch.mode)
-                    {
-                        case StretchMode::Linear:
-                            out = t;
-                            break;
-                        case StretchMode::Asinh:
-                            out = clamp01f(std::asinh(s * t) / asinhDenom);
-                            break;
-                        case StretchMode::Log:
-                            out = clamp01f(std::log(1.0f + s * t) / logDenom);
-                            break;
-                        case StretchMode::Sqrt:
-                            out = std::sqrt(t);
-                            break;
-                    }
-                }
-                channel = clamp01f(out);
-            }
-
-            const size_t outRow = static_cast<size_t>(viewportHeight - 1 - y);
-            const size_t base = (outRow * viewportWidth + static_cast<size_t>(x)) * 3;
-            outRgb[base + 0] = static_cast<unsigned char>(std::lround(color[0] * 255.0f));
-            outRgb[base + 1] = static_cast<unsigned char>(std::lround(color[1] * 255.0f));
-            outRgb[base + 2] = static_cast<unsigned char>(std::lround(color[2] * 255.0f));
-        }
-    }
     return true;
 }
 
@@ -1241,18 +1060,6 @@ bool FitsRenderer::recomputeAutoStretch()
 
 bool FitsRenderer::getLumaHistogram(std::vector<float>& outHist) const
 {
-    if (_exportDenoiseMode > 0)
-    {
-        if (!ensureHqLinearCache())
-            return false;
-        return compute_histogram_from_linear_rgb(_hqLinearRgbCache,
-                                                 _hqLinearCacheW,
-                                                 _hqLinearCacheH,
-                                                 _stretch,
-                                                 _autoLow,
-                                                 _autoHigh,
-                                                 outHist);
-    }
     if (!asGl(_gl))
         return false;
     return asGl(_gl)->getLuminanceHistogram(outHist);
@@ -1269,99 +1076,41 @@ void FitsRenderer::render(int viewportWidth, int viewportHeight)
 bool FitsRenderer::renderToImage(std::vector<unsigned char>& outRGB,
                                  int& outWidth, int& outHeight) const
 {
-    if (!_hasImage || !asGl(_gl) || !asFits(_fits))
+    if (!_hasImage || !asGl(_gl))
         return false;
-
-    if (_exportDenoiseMode > 0)
-    {
-        if (!ensureHqLinearCache())
-            return false;
-        outWidth = _hqLinearCacheW;
-        outHeight = _hqLinearCacheH;
-        return render_hq_export(_hqLinearRgbCache,
-                                outWidth,
-                                outHeight,
-                                _stretch,
-                                _autoLow,
-                                _autoHigh,
-                                outRGB);
-    }
 
     outWidth = _imgWidth;
     outHeight = _imgHeight;
     return asGl(_gl)->renderToImage(outWidth, outHeight, outRGB);
 }
 
+bool FitsRenderer::renderHqToImage(std::vector<unsigned char>& outRGB,
+                                   int& outWidth, int& outHeight) const
+{
+    if (!_hasImage || !asGl(_gl) || !asFits(_fits))
+        return false;
+
+    if (_exportDenoiseMode <= 0)
+        return renderToImage(outRGB, outWidth, outHeight);
+
+    if (!ensureHqLinearCache())
+        return false;
+
+    outWidth = _hqLinearCacheW;
+    outHeight = _hqLinearCacheH;
+    return render_hq_export(_hqLinearRgbCache,
+                            outWidth,
+                            outHeight,
+                            _stretch,
+                            _autoLow,
+                            _autoHigh,
+                            outRGB);
+}
+
 bool FitsRenderer::renderPreview(int width, int height)
 {
     if (!_hasImage || !asGl(_gl))
         return false;
-    if (_exportDenoiseMode > 0)
-    {
-        const bool samePreview =
-            _hqPreviewCacheValid &&
-            _hqPreviewCacheW == width &&
-            _hqPreviewCacheH == height &&
-            _hqPreviewAutoLow == _autoLow &&
-            _hqPreviewAutoHigh == _autoHigh &&
-            _hqPreviewView.scale == _view.scale &&
-            _hqPreviewView.panX == _view.panX &&
-            _hqPreviewView.panY == _view.panY &&
-            _hqPreviewStretch.autoStretch == _stretch.autoStretch &&
-            _hqPreviewStretch.blackClip == _stretch.blackClip &&
-            _hqPreviewStretch.whiteClip == _stretch.whiteClip &&
-            _hqPreviewStretch.strength == _stretch.strength &&
-            _hqPreviewStretch.mode == _stretch.mode;
-
-        if (!samePreview || _hqPreviewNeedsHighRes)
-        {
-            if (!ensureHqLinearCache())
-                return false;
-
-            std::vector<unsigned char> previewRgb;
-            const bool useLowResFirst = !samePreview &&
-                _hqLinearLowResCacheValid &&
-                (width >= 512 || height >= 512);
-            const std::vector<float>& sourceRgb =
-                (useLowResFirst || _hqPreviewNeedsHighRes == false) && useLowResFirst
-                ? _hqLinearLowResRgbCache
-                : _hqLinearRgbCache;
-            const int sourceW =
-                (useLowResFirst || _hqPreviewNeedsHighRes == false) && useLowResFirst
-                ? _hqLinearLowResCacheW
-                : _hqLinearCacheW;
-            const int sourceH =
-                (useLowResFirst || _hqPreviewNeedsHighRes == false) && useLowResFirst
-                ? _hqLinearLowResCacheH
-                : _hqLinearCacheH;
-
-            if (!render_rgb_view_to_u8(sourceRgb,
-                                       sourceW,
-                                       sourceH,
-                                       _stretch,
-                                       _autoLow,
-                                       _autoHigh,
-                                       _view,
-                                       width,
-                                       height,
-                                       previewRgb))
-            {
-                return false;
-            }
-            if (!asGl(_gl)->uploadPreviewRgb(previewRgb, width, height))
-                return false;
-
-            _hqPreviewCacheValid = true;
-            _hqPreviewCacheW = width;
-            _hqPreviewCacheH = height;
-            _hqPreviewStretch = _stretch;
-            _hqPreviewView = _view;
-            _hqPreviewAutoLow = _autoLow;
-            _hqPreviewAutoHigh = _autoHigh;
-            _hqPreviewNeedsHighRes = useLowResFirst;
-        }
-        return true;
-    }
 
     asGl(_gl)->setViewParams(_view.scale, _view.panX, _view.panY);
     return asGl(_gl)->renderPreview(width, height);

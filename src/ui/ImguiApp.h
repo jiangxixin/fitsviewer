@@ -36,6 +36,8 @@ private:
     // Individual windows
     void render_stack_window();
     void render_file_browse_window();
+    void render_inspector_window();
+    void render_controls_panel();
 
     // Rebuild StackCore from UI list
     void rebuildStackCoreFromUi();
@@ -150,4 +152,5 @@ private:
     std::string _stackLog;
     IndexJobState _indexJob;
     StackJobState _stackJob;
+    double _lastInteractiveAutoStretchUpdate = -1.0;
 };
