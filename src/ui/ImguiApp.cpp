@@ -13,6 +13,8 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -28,6 +30,20 @@ static std::string path_to_utf8(const fs::path& p)
 static fs::path utf8_to_path(const std::string& s)
 {
     return fs::u8path(s);
+}
+
+static bool path_exists_utf8(const std::string& path)
+{
+    if (path.empty())
+        return false;
+    try
+    {
+        return fs::exists(utf8_to_path(path));
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 static bool setup_imgui_fonts()
@@ -150,24 +166,45 @@ bool ImguiApp::init()
     {
         _currentDir    = path_to_utf8(fs::current_path());
         _fileDialogDir = _currentDir;
+        _indexDbPath   = path_to_utf8(fs::current_path() / fs::u8path("fits_index.sqlite"));
     }
     catch (...)
     {
         _currentDir    = ".";
         _fileDialogDir = ".";
+        _indexDbPath   = "fits_index.sqlite";
     }
     _fileListDirty = true;
 
-    // First scan of current folder
+    std::string indexError;
+    if (!_fitsIndex.open(_indexDbPath, &indexError))
+        _indexStatus = "Index DB open failed: " + indexError;
+    else
+        _indexStatus = "Index DB: " + _indexDbPath;
+
+    loadSessionState();
+
+    // First scan of current folder / restored folder
     refreshDirFits();
-    loadDirFitsCurrent();
+    if (!_currentPath.empty() && path_exists_utf8(_currentPath))
+        setCurrentFitsPath(_currentPath);
+    else
+        loadDirFitsCurrent();
+    refreshSearchResults();
 
     return true;
 }
 
 void ImguiApp::shutdown()
 {
+    if (_indexJob.worker.joinable())
+        _indexJob.worker.join();
+    if (_stackJob.worker.joinable())
+        _stackJob.worker.join();
+
+    saveSessionState();
     _renderer.shutdown();
+    _fitsIndex.close();
 
     if (ImGui::GetCurrentContext())
     {
@@ -196,6 +233,7 @@ void ImguiApp::run()
 void ImguiApp::frame()
 {
     glfwPollEvents();
+    pollBackgroundJobs();
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -222,6 +260,7 @@ bool ImguiApp::loadCurrentFits()
     if (_currentPath.empty())
     {
         _hasImage = false;
+        _showingStackResult = false;
         _histogram.clear();
         return false;
     }
@@ -229,18 +268,37 @@ bool ImguiApp::loadCurrentFits()
     if (_renderer.loadFits(_currentPath, _bayer))
     {
         _hasImage = true;
+        _showingStackResult = false;
         _renderer.setStretchParams(_stretch);
         _renderer.setWhiteBalance(_wb);
+        syncRendererLinearDenoise();
 
-        _renderer.recomputeAutoStretch();
-        _histogram.clear();
-        _renderer.getLumaHistogram(_histogram);
+        refreshRendererHistogram();
 
         return true;
     }
 
     _hasImage = false;
+    _showingStackResult = false;
     _histogram.clear();
+    return false;
+}
+
+void ImguiApp::clearCurrentFitsSelection()
+{
+    _currentPath.clear();
+    _hasImage = false;
+    _showingStackResult = false;
+    _histogram.clear();
+}
+
+bool ImguiApp::setCurrentFitsPath(const std::string& path)
+{
+    _currentPath = path;
+    if (loadCurrentFits())
+        return true;
+
+    clearCurrentFitsSelection();
     return false;
 }
 
@@ -276,20 +334,25 @@ void ImguiApp::refreshDirFits()
         std::sort(_dirFits.begin(), _dirFits.end());
         if (!_dirFits.empty())
             _dirFitsIndex = 0;
+        else
+            clearCurrentFitsSelection();
     }
     catch (const std::exception& e)
     {
         std::cerr << "refreshDirFits error: " << e.what() << "\n";
+        clearCurrentFitsSelection();
     }
 }
 
 bool ImguiApp::loadDirFitsCurrent()
 {
     if (_dirFitsIndex < 0 || _dirFitsIndex >= (int)_dirFits.size())
+    {
+        clearCurrentFitsSelection();
         return false;
+    }
 
-    _currentPath = _dirFits[_dirFitsIndex];
-    return loadCurrentFits();
+    return setCurrentFitsPath(_dirFits[_dirFitsIndex]);
 }
 
 void ImguiApp::browseDirFits(int delta)
@@ -309,6 +372,454 @@ void ImguiApp::browseDirFits(int delta)
     {
         _dirFitsIndex = idx;
         loadDirFitsCurrent();
+    }
+}
+
+void ImguiApp::refreshSearchResults()
+{
+    _searchResults.clear();
+    _searchResultChecked.clear();
+    _searchSelectedIndex = -1;
+
+    if (!_fitsIndex.isOpen() || _currentDir.empty())
+        return;
+
+    if (_searchQuery.empty())
+        return;
+
+    std::string errorMessage;
+    if (!_fitsIndex.search(_currentDir, _searchQuery, _searchResults, errorMessage))
+    {
+        _indexStatus = "Search failed: " + errorMessage;
+        return;
+    }
+
+    _searchResultChecked.assign(_searchResults.size(), false);
+}
+
+void ImguiApp::syncRendererLinearDenoise()
+{
+    const kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
+    const bool previewEnabled = _showingStackResult &&
+        denoiseCfg.previewMode == kty::DenoiseConfig::PreviewMode::FastBilateral;
+    if (!previewEnabled)
+    {
+        _renderer.setLinearDenoiseConfig(false, 0.0f, denoiseCfg.backgroundSigma, 1);
+    }
+    else
+    {
+        _renderer.setLinearDenoiseConfig(true,
+                                         denoiseCfg.strength,
+                                         denoiseCfg.backgroundSigma,
+                                         denoiseCfg.iterations);
+    }
+
+    const int exportMode = _showingStackResult ? static_cast<int>(denoiseCfg.exportMode) : 0;
+    _renderer.setExportDenoiseConfig(exportMode,
+                                     denoiseCfg.strength,
+                                     denoiseCfg.backgroundSigma,
+                                     denoiseCfg.iterations);
+}
+
+void ImguiApp::refreshRendererHistogram()
+{
+    if (!_hasImage)
+    {
+        _histogram.clear();
+        return;
+    }
+
+    _renderer.recomputeAutoStretch();
+    _histogram.clear();
+    _renderer.getLumaHistogram(_histogram);
+}
+
+void ImguiApp::resetControlParams()
+{
+    _bayer = kty::BayerPattern::RGGB;
+    _stretch = kty::StretchParams{};
+    _wb = kty::WhiteBalance{};
+    _view = kty::ViewParams{};
+
+    if (!_hasImage)
+    {
+        _histogram.clear();
+        return;
+    }
+
+    _renderer.setBayerPattern(_bayer);
+    _renderer.setStretchParams(_stretch);
+    _renderer.setWhiteBalance(_wb);
+    _renderer.setViewParams(_view);
+    refreshRendererHistogram();
+}
+
+void ImguiApp::resetStackParams()
+{
+    _stack.setCalibConfig(kty::CalibConfig{});
+    _stack.setRejectConfig(kty::RejectConfig{});
+    _stack.setDenoiseConfig(kty::DenoiseConfig{});
+
+    if (_hasImage)
+    {
+        syncRendererLinearDenoise();
+        refreshRendererHistogram();
+    }
+
+    _stackLog += "Stack parameters reset to defaults.\n";
+}
+
+void ImguiApp::indexCurrentFolder()
+{
+    startIndexJob();
+}
+
+void ImguiApp::startIndexJob()
+{
+    if (_currentDir.empty())
+    {
+        _indexStatus = "No folder selected.";
+        return;
+    }
+    if (_indexJob.running)
+        return;
+
+    if (_indexJob.worker.joinable())
+        _indexJob.worker.join();
+
+    const std::string rootDir = _currentDir;
+    const std::string dbPath = _indexDbPath;
+
+    {
+        std::lock_guard<std::mutex> lock(_indexJob.mutex);
+        _indexJob.running = true;
+        _indexJob.finished = false;
+        _indexJob.success = false;
+        _indexJob.progress = 0.0f;
+        _indexJob.message = "Starting index job...";
+        _indexJob.log.clear();
+    }
+
+    _indexJob.worker = std::thread([this, rootDir, dbPath]() {
+        kty::FitsIndexDb db;
+        std::string errorMessage;
+        bool ok = db.open(dbPath, &errorMessage);
+        std::string log;
+
+        if (ok)
+        {
+            ok = db.rebuildIndexForRoot(
+                rootDir,
+                log,
+                [this](float progress, const std::string& message) {
+                    std::lock_guard<std::mutex> lock(_indexJob.mutex);
+                    _indexJob.progress = progress;
+                    _indexJob.message = message;
+                });
+        }
+        else
+        {
+            log = errorMessage;
+        }
+
+        std::lock_guard<std::mutex> lock(_indexJob.mutex);
+        _indexJob.running = false;
+        _indexJob.finished = true;
+        _indexJob.success = ok;
+        _indexJob.progress = ok ? 1.0f : _indexJob.progress;
+        _indexJob.message = ok ? "Index complete." : "Index failed.";
+        _indexJob.log = log;
+    });
+}
+
+void ImguiApp::loadSearchResult(int index)
+{
+    if (index < 0 || index >= (int)_searchResults.size())
+        return;
+
+    setCurrentFitsPath(_searchResults[index].path);
+}
+
+bool ImguiApp::addStackFile(const std::string& path, kty::FrameType type)
+{
+    auto it = std::find_if(_stackFiles.begin(), _stackFiles.end(),
+                           [&](const StackFileItem& item) {
+                               return item.path == path && item.type == type;
+                           });
+    if (it != _stackFiles.end())
+        return false;
+
+    _stackFiles.push_back({path, type});
+    return true;
+}
+
+void ImguiApp::addSelectedSearchResultsToStack(kty::FrameType type)
+{
+    int added = 0;
+    for (size_t i = 0; i < _searchResults.size() && i < _searchResultChecked.size(); ++i)
+    {
+        if (!_searchResultChecked[i])
+            continue;
+        if (addStackFile(_searchResults[i].path, type))
+            ++added;
+    }
+
+    if (added > 0)
+    {
+        rebuildStackCoreFromUi();
+        std::ostringstream oss;
+        oss << "Added " << added << " indexed result(s) to stack.\n";
+        _stackLog += oss.str();
+    }
+}
+
+int ImguiApp::selectedSearchResultCount() const
+{
+    int count = 0;
+    for (bool checked : _searchResultChecked)
+    {
+        if (checked)
+            ++count;
+    }
+    return count;
+}
+
+bool ImguiApp::saveSessionState()
+{
+    if (_indexDbPath.empty())
+        return false;
+
+    kty::AppSessionData data;
+    data.currentDir = _currentDir;
+    data.currentPath = path_exists_utf8(_currentPath) ? _currentPath : std::string{};
+    data.bayer = static_cast<int>(_bayer);
+
+    const kty::CalibConfig calibCfg = _stack.calibConfig();
+    data.useBias = calibCfg.useBias;
+    data.useDark = calibCfg.useDark;
+    data.useFlat = calibCfg.useFlat;
+
+    const kty::RejectConfig rejectCfg = _stack.rejectConfig();
+    data.rejectMethod = static_cast<int>(rejectCfg.method);
+    data.sigmaLow = rejectCfg.sigmaLow;
+    data.sigmaHigh = rejectCfg.sigmaHigh;
+    data.minSamples = rejectCfg.minSamples;
+
+    const kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
+    data.denoisePreviewMode = static_cast<int>(denoiseCfg.previewMode);
+    data.denoiseExportMode = static_cast<int>(denoiseCfg.exportMode);
+    data.denoiseStrength = denoiseCfg.strength;
+    data.backgroundSigma = denoiseCfg.backgroundSigma;
+    data.denoiseIterations = denoiseCfg.iterations;
+
+    data.stackFiles.reserve(_stackFiles.size());
+    for (const auto& item : _stackFiles)
+    {
+        if (!item.path.empty())
+            data.stackFiles.push_back({item.path, static_cast<int>(item.type)});
+    }
+
+    std::string errorMessage;
+    if (!_sessionStore.save(_indexDbPath, data, errorMessage))
+    {
+        _indexStatus = "Save session failed: " + errorMessage;
+        return false;
+    }
+
+    _indexStatus = "Session saved.";
+    return true;
+}
+
+void ImguiApp::loadSessionState()
+{
+    if (_indexDbPath.empty())
+        return;
+
+    kty::AppSessionData data;
+    std::string errorMessage;
+    if (!_sessionStore.load(_indexDbPath, data, errorMessage))
+    {
+        _indexStatus = "Load session failed: " + errorMessage;
+        return;
+    }
+
+    if (!data.currentDir.empty() && path_exists_utf8(data.currentDir))
+        _currentDir = data.currentDir;
+    _fileDialogDir = _currentDir;
+
+    _bayer = static_cast<kty::BayerPattern>(std::clamp(data.bayer, 0, 4));
+
+    kty::CalibConfig calibCfg = _stack.calibConfig();
+    calibCfg.useBias = data.useBias;
+    calibCfg.useDark = data.useDark;
+    calibCfg.useFlat = data.useFlat;
+    _stack.setCalibConfig(calibCfg);
+
+    kty::RejectConfig rejectCfg = _stack.rejectConfig();
+    rejectCfg.method = static_cast<kty::RejectConfig::Method>(std::clamp(data.rejectMethod, 0, 1));
+    rejectCfg.sigmaLow = data.sigmaLow;
+    rejectCfg.sigmaHigh = data.sigmaHigh;
+    rejectCfg.minSamples = data.minSamples;
+    _stack.setRejectConfig(rejectCfg);
+
+    kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
+    denoiseCfg.previewMode = static_cast<kty::DenoiseConfig::PreviewMode>(
+        std::clamp(data.denoisePreviewMode, 0, 1));
+    denoiseCfg.exportMode = static_cast<kty::DenoiseConfig::ExportMode>(
+        std::clamp(data.denoiseExportMode, 0, 2));
+    denoiseCfg.strength = data.denoiseStrength;
+    denoiseCfg.backgroundSigma = data.backgroundSigma;
+    denoiseCfg.iterations = data.denoiseIterations;
+    _stack.setDenoiseConfig(denoiseCfg);
+
+    _stackFiles.clear();
+    for (const auto& item : data.stackFiles)
+    {
+        if (!path_exists_utf8(item.path))
+            continue;
+
+        kty::FrameType type = kty::FrameType::Light;
+        if (item.type >= 0 && item.type <= 3)
+            type = static_cast<kty::FrameType>(item.type);
+        _stackFiles.push_back({item.path, type});
+    }
+    _stackSelectedIndex = _stackFiles.empty() ? -1 : 0;
+    rebuildStackCoreFromUi();
+
+    if (!data.currentPath.empty() && path_exists_utf8(data.currentPath))
+        _currentPath = data.currentPath;
+}
+
+void ImguiApp::startStackJob()
+{
+    if (_stackJob.running)
+        return;
+    if (_stackFiles.empty())
+    {
+        _stackLog = "No frames added yet.\n";
+        return;
+    }
+    if (_stackJob.worker.joinable())
+        _stackJob.worker.join();
+
+    const std::vector<StackFileItem> stackFiles = _stackFiles;
+    const kty::CalibConfig calibCfg = _stack.calibConfig();
+    const kty::RejectConfig rejectCfg = _stack.rejectConfig();
+    const kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
+
+    {
+        std::lock_guard<std::mutex> lock(_stackJob.mutex);
+        _stackJob.running = true;
+        _stackJob.finished = false;
+        _stackJob.success = false;
+        _stackJob.progress = 0.0f;
+        _stackJob.message = "Preparing stack...";
+        _stackJob.log.clear();
+        _stackJob.result = kty::StackResult{};
+    }
+
+    _stackJob.worker = std::thread([this, stackFiles, calibCfg, rejectCfg, denoiseCfg]() {
+        kty::StackCore workerStack;
+        workerStack.setCalibConfig(calibCfg);
+        workerStack.setRejectConfig(rejectCfg);
+        workerStack.setDenoiseConfig(denoiseCfg);
+        for (const auto& item : stackFiles)
+            workerStack.addFrame(item.path, item.type);
+
+        kty::StackResult result;
+        const bool ok = workerStack.runStack(
+            result,
+            [this](float progress, const std::string& message) {
+                std::lock_guard<std::mutex> lock(_stackJob.mutex);
+                _stackJob.progress = progress;
+                _stackJob.message = message;
+            });
+
+        std::lock_guard<std::mutex> lock(_stackJob.mutex);
+        _stackJob.running = false;
+        _stackJob.finished = true;
+        _stackJob.success = ok;
+        _stackJob.progress = ok ? 1.0f : _stackJob.progress;
+        _stackJob.message = ok ? "Stack complete." : "Stack failed.";
+        _stackJob.log = result.log.empty() ? workerStack.log() : result.log;
+        _stackJob.result = std::move(result);
+    });
+}
+
+void ImguiApp::pollBackgroundJobs()
+{
+    bool indexFinished = false;
+    bool indexSuccess = false;
+    std::string indexLog;
+    {
+        std::lock_guard<std::mutex> lock(_indexJob.mutex);
+        if (_indexJob.finished)
+        {
+            indexFinished = true;
+            indexSuccess = _indexJob.success;
+            indexLog = _indexJob.log;
+            _indexJob.finished = false;
+        }
+    }
+    if (indexFinished)
+    {
+        if (_indexJob.worker.joinable())
+            _indexJob.worker.join();
+        _indexStatus = indexSuccess ? indexLog : ("Index failed: " + indexLog);
+        if (indexSuccess)
+            refreshSearchResults();
+    }
+
+    bool stackFinished = false;
+    bool stackSuccess = false;
+    std::string stackLog;
+    kty::StackResult stackResult;
+    {
+        std::lock_guard<std::mutex> lock(_stackJob.mutex);
+        if (_stackJob.finished)
+        {
+            stackFinished = true;
+            stackSuccess = _stackJob.success;
+            stackLog = _stackJob.log;
+            stackResult = _stackJob.result;
+            _stackJob.finished = false;
+        }
+    }
+    if (stackFinished)
+    {
+        if (_stackJob.worker.joinable())
+            _stackJob.worker.join();
+
+        _stackLog = stackLog;
+        if (stackSuccess)
+        {
+            _wb.r = 1.0f;
+            _wb.g = 1.0f;
+            _wb.b = 1.0f;
+            if (_renderer.loadMonochromeImage(stackResult.finalImage.raw,
+                                              stackResult.finalImage.width,
+                                              stackResult.finalImage.height,
+                                              _bayer))
+            {
+                _hasImage = true;
+                _showingStackResult = true;
+                _currentPath = "[Stack Result]";
+                _view.scale = 1.0f;
+                _view.panX = 0.0f;
+                _view.panY = 0.0f;
+                syncRendererLinearDenoise();
+                _renderer.computeBackgroundNeutralization();
+                _wb = _renderer.whiteBalance();
+                _renderer.setStretchParams(_stretch);
+                _renderer.setWhiteBalance(_wb);
+                refreshRendererHistogram();
+                _stackLog += "Stack preview updated with background neutralization.\n";
+            }
+            else
+            {
+                _stackLog += "Stack computed but preview upload failed.\n";
+            }
+        }
     }
 }
 
@@ -400,21 +911,26 @@ void ImguiApp::render_ui()
     ImGui::Begin("Controls");
 
     ImGui::TextUnformatted("Image Controls");
+    ImGui::SameLine();
+    if (ImGui::Button("Reset Controls"))
+        resetControlParams();
 
     // Bayer selection
     ImGui::Separator();
     const char* patterns[] = {"None", "RGGB", "BGGR", "GRBG", "GBRG"};
     int bayerIndex = static_cast<int>(_bayer);
-    bool bayerChanged = false;
+    bool refreshHistogram = false;
     if (ImGui::Combo("Bayer", &bayerIndex, patterns, IM_ARRAYSIZE(patterns)))
     {
         kty::BayerPattern newB = static_cast<kty::BayerPattern>(bayerIndex);
         if (newB != _bayer)
         {
             _bayer = newB;
-            bayerChanged = true;
             if (_hasImage)
+            {
                 _renderer.setBayerPattern(_bayer);
+                refreshHistogram = true;
+            }
         }
     }
 
@@ -428,34 +944,36 @@ void ImguiApp::render_ui()
     {
         _stretch.mode = static_cast<kty::StretchMode>(stretchIndex);
         if (_hasImage)
+        {
             _renderer.setStretchParams(_stretch);
+            refreshHistogram = true;
+        }
     }
 
-    bool autoParamsChanged = false;
-
     if (ImGui::Checkbox("Auto Stretch", &_stretch.autoStretch))
-        autoParamsChanged = true;
+    {
+        if (_hasImage)
+        {
+            _renderer.setStretchParams(_stretch);
+            refreshHistogram = true;
+        }
+    }
 
-    if (ImGui::SliderFloat("Black clip %", &_stretch.blackClip, 0.0f, 20.0f))
-        if (ImGui::IsItemEdited()) autoParamsChanged = true;
+    bool stretchSliderCommitted = false;
 
-    if (ImGui::SliderFloat("White clip %", &_stretch.whiteClip, 0.0f, 20.0f))
-        if (ImGui::IsItemEdited()) autoParamsChanged = true;
+    ImGui::SliderFloat("Black clip %", &_stretch.blackClip, 0.0f, 20.0f);
+    stretchSliderCommitted |= ImGui::IsItemDeactivatedAfterEdit();
 
-    if (ImGui::SliderFloat("Stretch strength", &_stretch.strength, 1.0f, 20.0f))
-        if (ImGui::IsItemEdited()) autoParamsChanged = true;
+    ImGui::SliderFloat("White clip %", &_stretch.whiteClip, 0.0f, 20.0f);
+    stretchSliderCommitted |= ImGui::IsItemDeactivatedAfterEdit();
 
-    if (stretchModeChanged) autoParamsChanged = true;
-    if (bayerChanged)       autoParamsChanged = true;
+    ImGui::SliderFloat("Stretch strength", &_stretch.strength, 1.0f, 20.0f);
+    stretchSliderCommitted |= ImGui::IsItemDeactivatedAfterEdit();
 
-    if (autoParamsChanged && _hasImage)
+    if (stretchSliderCommitted && _hasImage)
     {
         _renderer.setStretchParams(_stretch);
-        if (_renderer.recomputeAutoStretch())
-        {
-            _histogram.clear();
-            _renderer.getLumaHistogram(_histogram);
-        }
+        refreshHistogram = true;
     }
 
     // View scale
@@ -479,34 +997,40 @@ void ImguiApp::render_ui()
 
     // White balance
     ImGui::Separator();
-    bool wbChanged = false;
-    if (ImGui::SliderFloat("R gain", &_wb.r, 0.1f, 4.0f)) wbChanged = true;
-    if (ImGui::SliderFloat("G gain", &_wb.g, 0.1f, 4.0f)) wbChanged = true;
-    if (ImGui::SliderFloat("B gain", &_wb.b, 0.1f, 4.0f)) wbChanged = true;
+    bool wbCommitted = false;
+    ImGui::SliderFloat("R gain", &_wb.r, 0.1f, 4.0f);
+    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::SliderFloat("G gain", &_wb.g, 0.1f, 4.0f);
+    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::SliderFloat("B gain", &_wb.b, 0.1f, 4.0f);
+    wbCommitted |= ImGui::IsItemDeactivatedAfterEdit();
 
     if (ImGui::Button("Auto White Balance"))
     {
         if (_hasImage && _renderer.computeAutoWhiteBalance())
         {
             _wb = _renderer.whiteBalance();
-
-            if (_renderer.recomputeAutoStretch())
-            {
-                _histogram.clear();
-                _renderer.getLumaHistogram(_histogram);
-            }
+            refreshHistogram = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Background Neutralization"))
+    {
+        if (_hasImage && _renderer.computeBackgroundNeutralization())
+        {
+            _wb = _renderer.whiteBalance();
+            refreshHistogram = true;
         }
     }
 
-    if (wbChanged && _hasImage)
+    if (wbCommitted && _hasImage)
     {
         _renderer.setWhiteBalance(_wb);
-        if (_renderer.recomputeAutoStretch())
-        {
-            _histogram.clear();
-            _renderer.getLumaHistogram(_histogram);
-        }
+        refreshHistogram = true;
     }
+
+    if (refreshHistogram)
+        refreshRendererHistogram();
 
     // Export PNG
     ImGui::Separator();
@@ -660,7 +1184,7 @@ void ImguiApp::render_file_browse_window()
 {
     ImGui::Begin("File Browse");
 
-    ImGui::TextUnformatted("Folder & FITS file list");
+    ImGui::TextUnformatted("Folder, Index & Search");
 
     ImGui::Separator();
     ImGui::InputText("Folder", &_currentDir, ImGuiInputTextFlags_ReadOnly);
@@ -673,49 +1197,178 @@ void ImguiApp::render_file_browse_window()
         refreshDirFits();
         loadDirFitsCurrent();
     }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(_indexJob.running || _currentDir.empty());
+    if (ImGui::Button("Index Folder"))
+        indexCurrentFolder();
+    ImGui::EndDisabled();
+
+    if (!_indexStatus.empty())
+        ImGui::TextWrapped("%s", _indexStatus.c_str());
+
+    if (_indexJob.running)
+    {
+        float progress = 0.0f;
+        std::string message;
+        {
+            std::lock_guard<std::mutex> lock(_indexJob.mutex);
+            progress = _indexJob.progress;
+            message = _indexJob.message;
+        }
+        ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f), message.c_str());
+    }
+
+    bool searchChanged = ImGui::InputTextWithHint("Search Indexed FITS",
+                                                  "filename, OBJECT, FILTER, EXTNAME...",
+                                                  &_searchQuery);
+    if (searchChanged)
+        refreshSearchResults();
 
     ImGui::Separator();
-    ImGui::Text("FITS files: %d", (int)_dirFits.size());
-
-    // File list with keyboard focus
-    ImGui::BeginChild("dir_fits_list", ImVec2(0, 0), true);
-
-    bool windowFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-    if (windowFocused)
+    if (_searchQuery.empty())
     {
-        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
-            browseDirFits(-1);
-        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
-            browseDirFits(+1);
-    }
+        ImGui::Text("FITS files in current folder: %d", (int)_dirFits.size());
 
-    for (int i = 0; i < (int)_dirFits.size(); ++i)
-    {
-        fs::path p = utf8_to_path(_dirFits[i]);
-        std::string label = path_to_utf8(p.filename());
-        bool selected = (i == _dirFitsIndex);
+        ImGui::BeginChild("dir_fits_list", ImVec2(0, 0), true);
 
-        if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick))
+        bool windowFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        if (windowFocused)
         {
-            _dirFitsIndex = i;
-            loadDirFitsCurrent();
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+                browseDirFits(-1);
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+                browseDirFits(+1);
         }
 
-        if (selected)
-            ImGui::SetItemDefaultFocus();
-    }
+        for (int i = 0; i < (int)_dirFits.size(); ++i)
+        {
+            fs::path p = utf8_to_path(_dirFits[i]);
+            std::string label = path_to_utf8(p.filename());
+            bool selected = (i == _dirFitsIndex);
 
-    if (_dirFits.empty())
-    {
-        ImGui::TextDisabled("No FITS file in this folder.");
+            if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick))
+            {
+                _dirFitsIndex = i;
+                loadDirFitsCurrent();
+            }
+
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+
+        if (_dirFits.empty())
+        {
+            ImGui::TextDisabled("No FITS file in this folder.");
+        }
+        else
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Use Up/Down arrow keys to preview.");
+        }
+
+        ImGui::EndChild();
     }
     else
     {
-        ImGui::Spacing();
-        ImGui::TextDisabled("Use Up/Down arrow keys to preview.");
-    }
+        ImGui::Text("Indexed matches: %d", (int)_searchResults.size());
+        ImGui::SameLine();
+        ImGui::TextDisabled("Selected: %d", selectedSearchResultCount());
 
-    ImGui::EndChild();
+        if (!_searchResults.empty())
+        {
+            if (ImGui::Button("Load Selected Result"))
+                loadSearchResult(_searchSelectedIndex);
+            ImGui::SameLine();
+            if (ImGui::Button("Select All"))
+            {
+                for (size_t i = 0; i < _searchResultChecked.size(); ++i)
+                    _searchResultChecked[i] = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear Selection"))
+            {
+                for (size_t i = 0; i < _searchResultChecked.size(); ++i)
+                    _searchResultChecked[i] = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Add Selected as Light"))
+                addSelectedSearchResultsToStack(kty::FrameType::Light);
+            ImGui::SameLine();
+            if (ImGui::Button("Add Selected as Dark"))
+                addSelectedSearchResultsToStack(kty::FrameType::Dark);
+
+            if (ImGui::Button("Add Selected as Flat"))
+                addSelectedSearchResultsToStack(kty::FrameType::Flat);
+            ImGui::SameLine();
+            if (ImGui::Button("Add Selected as Bias"))
+                addSelectedSearchResultsToStack(kty::FrameType::Bias);
+        }
+
+        ImGui::BeginChild("search_result_list", ImVec2(0, 0), true);
+        for (int i = 0; i < (int)_searchResults.size(); ++i)
+        {
+            const auto& item = _searchResults[i];
+            const bool selected = (i == _searchSelectedIndex);
+            bool checked = (i < (int)_searchResultChecked.size()) ? _searchResultChecked[i] : false;
+
+            ImGui::PushID(i);
+            if (ImGui::Checkbox("##checked", &checked) && i < (int)_searchResultChecked.size())
+                _searchResultChecked[i] = checked;
+            ImGui::SameLine();
+
+            std::ostringstream label;
+            label << item.fileName;
+            if (item.width > 0 && item.height > 0)
+                label << "  [" << item.width << "x" << item.height;
+            if (item.depth > 1)
+                label << "x" << item.depth;
+            if (item.width > 0 && item.height > 0)
+                label << "]";
+            if (item.imageHduCount > 0)
+                label << "  IMG:" << item.imageHduCount;
+            if (item.hduCount > 0)
+                label << "  HDU:" << item.hduCount;
+
+            if (ImGui::Selectable(label.str().c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick))
+            {
+                _searchSelectedIndex = i;
+                if (ImGui::IsMouseDoubleClicked(0))
+                    loadSearchResult(i);
+            }
+
+            ImGui::TextDisabled("%s", item.path.c_str());
+            if (!item.objectName.empty())
+                ImGui::Text("OBJECT: %s", item.objectName.c_str());
+            if (!item.filterName.empty() || !item.extNames.empty() || !item.dateObs.empty())
+            {
+                std::ostringstream meta;
+                if (!item.filterName.empty())
+                    meta << "FILTER=" << item.filterName;
+                if (!item.dateObs.empty())
+                {
+                    if (!meta.str().empty())
+                        meta << "  ";
+                    meta << "DATE-OBS=" << item.dateObs;
+                }
+                if (!item.extNames.empty())
+                {
+                    const std::string current = meta.str();
+                    if (!current.empty())
+                        meta << "  ";
+                    meta << "EXT=" << item.extNames;
+                }
+                const std::string metaText = meta.str();
+                ImGui::TextWrapped("%s", metaText.c_str());
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+
+        if (_searchResults.empty())
+            ImGui::TextDisabled("No indexed result. Click 'Index Folder' first or adjust keywords.");
+
+        ImGui::EndChild();
+    }
 
     ImGui::End();
 }
@@ -766,26 +1419,26 @@ void ImguiApp::render_stack_window()
     {
         if (ImGui::Button("Add as Light"))
         {
-            _stackFiles.push_back({ _currentPath, kty::FrameType::Light });
-            rebuildStackCoreFromUi();
+            if (addStackFile(_currentPath, kty::FrameType::Light))
+                rebuildStackCoreFromUi();
         }
         ImGui::SameLine();
         if (ImGui::Button("Add as Dark"))
         {
-            _stackFiles.push_back({ _currentPath, kty::FrameType::Dark });
-            rebuildStackCoreFromUi();
+            if (addStackFile(_currentPath, kty::FrameType::Dark))
+                rebuildStackCoreFromUi();
         }
         ImGui::SameLine();
         if (ImGui::Button("Add as Flat"))
         {
-            _stackFiles.push_back({ _currentPath, kty::FrameType::Flat });
-            rebuildStackCoreFromUi();
+            if (addStackFile(_currentPath, kty::FrameType::Flat))
+                rebuildStackCoreFromUi();
         }
         ImGui::SameLine();
         if (ImGui::Button("Add as Bias"))
         {
-            _stackFiles.push_back({ _currentPath, kty::FrameType::Bias });
-            rebuildStackCoreFromUi();
+            if (addStackFile(_currentPath, kty::FrameType::Bias))
+                rebuildStackCoreFromUi();
         }
     }
 
@@ -848,6 +1501,14 @@ void ImguiApp::render_stack_window()
         _stackLightCount = _stackDarkCount = _stackFlatCount = _stackBiasCount = 0;
         // keep log
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Save Stack Session"))
+    {
+        if (saveSessionState())
+            _stackLog += "Stack session saved.\n";
+        else
+            _stackLog += "Stack session save failed.\n";
+    }
 
     ImGui::Separator();
 
@@ -859,26 +1520,57 @@ void ImguiApp::render_stack_window()
     _stack.setCalibConfig(calibCfg);
 
     ImGui::Separator();
+    kty::RejectConfig rejectCfg = _stack.rejectConfig();
+    const char* rejectMethods[] = {"None", "Sigma Clip"};
+    int rejectMethod = static_cast<int>(rejectCfg.method);
+    if (ImGui::Combo("Rejection", &rejectMethod, rejectMethods, IM_ARRAYSIZE(rejectMethods)))
+        rejectCfg.method = static_cast<kty::RejectConfig::Method>(rejectMethod);
+    if (rejectCfg.method == kty::RejectConfig::Method::SigmaClip)
+    {
+        ImGui::SliderFloat("Low Sigma", &rejectCfg.sigmaLow, 1.5f, 5.0f, "%.2f");
+        ImGui::SliderFloat("High Sigma", &rejectCfg.sigmaHigh, 1.5f, 5.0f, "%.2f");
+        ImGui::SliderInt("Min Samples", &rejectCfg.minSamples, 3, 20);
+    }
+    _stack.setRejectConfig(rejectCfg);
+
+    ImGui::Separator();
+    kty::DenoiseConfig denoiseCfg = _stack.denoiseConfig();
+    const char* previewModes[] = {"Off", "Fast Bilateral Preview"};
+    const char* exportModes[] = {"Off", "HQ Wavelet Export", "HQ Wavelet + BM3D-style Export"};
+    int previewMode = static_cast<int>(denoiseCfg.previewMode);
+    int exportMode = static_cast<int>(denoiseCfg.exportMode);
+    bool denoiseChanged = ImGui::Combo("Preview Denoise", &previewMode, previewModes, IM_ARRAYSIZE(previewModes));
+    denoiseChanged |= ImGui::Combo("Export Denoise", &exportMode, exportModes, IM_ARRAYSIZE(exportModes));
+    denoiseCfg.previewMode = static_cast<kty::DenoiseConfig::PreviewMode>(previewMode);
+    denoiseCfg.exportMode = static_cast<kty::DenoiseConfig::ExportMode>(exportMode);
+    if (denoiseCfg.previewMode != kty::DenoiseConfig::PreviewMode::Off ||
+        denoiseCfg.exportMode != kty::DenoiseConfig::ExportMode::Off)
+    {
+        denoiseChanged |= ImGui::SliderFloat("Denoise Strength", &denoiseCfg.strength, 0.0f, 1.0f, "%.2f");
+        denoiseChanged |= ImGui::SliderFloat("Background Sigma", &denoiseCfg.backgroundSigma, 1.0f, 6.0f, "%.2f");
+        denoiseChanged |= ImGui::SliderInt("Denoise Iterations", &denoiseCfg.iterations, 1, 4);
+    }
+    _stack.setDenoiseConfig(denoiseCfg);
+    if (denoiseChanged && _hasImage)
+    {
+        syncRendererLinearDenoise();
+        refreshRendererHistogram();
+    }
+
+    ImGui::Separator();
 
     // Run / reset stack
+    ImGui::BeginDisabled(_stackJob.running);
     if (ImGui::Button("Run Stack"))
     {
         _stackLog.clear();
-
-        kty::StackResult res;
-        if (_stack.runStack(res))
-        {
-            _stackLog += res.log;
-            // TODO: later feed res.finalImage to FitsRenderer for preview
-        }
-        else
-        {
-            if (!res.log.empty())
-                _stackLog += res.log;
-            else
-                _stackLog += "runStack failed.\n";
-        }
+        startStackJob();
     }
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    if (ImGui::Button("Reset Stack Params"))
+        resetStackParams();
 
     ImGui::SameLine();
     if (ImGui::Button("Reset Stack Project"))
@@ -888,6 +1580,18 @@ void ImguiApp::render_stack_window()
         _stackLightCount = _stackDarkCount = _stackFlatCount = _stackBiasCount = 0;
         _stackSelectedIndex = -1;
         _stackLog.clear();
+    }
+
+    if (_stackJob.running)
+    {
+        float progress = 0.0f;
+        std::string message;
+        {
+            std::lock_guard<std::mutex> lock(_stackJob.mutex);
+            progress = _stackJob.progress;
+            message = _stackJob.message;
+        }
+        ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f), message.c_str());
     }
 
     // Log: always visible
@@ -1016,6 +1720,7 @@ void ImguiApp::render_file_dialog()
         _currentDir = _fileDialogDir;
         refreshDirFits();
         loadDirFitsCurrent();
+        refreshSearchResults();
         _showFileDialog = false;
     }
     ImGui::SameLine();

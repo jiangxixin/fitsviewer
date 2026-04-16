@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,15 +24,33 @@ struct CalibConfig {
 };
 
 struct RejectConfig {
-    // 像素拒绝算法：第一版可以只用 None/Median/SigmaClip 占位
+    // 参考 PixInsight/Siril 的像素拒绝思路，默认启用 SigmaClip
     enum class Method {
         None,
         SigmaClip
     };
-    Method method      = Method::None;
+    Method method      = Method::SigmaClip;
     float sigmaLow     = 3.0f;
     float sigmaHigh    = 3.0f;
     int   minSamples   = 3;
+};
+
+struct DenoiseConfig {
+    enum class PreviewMode {
+        Off,
+        FastBilateral
+    };
+    enum class ExportMode {
+        Off,
+        HQWavelet,
+        HQWaveletBm3dStyle
+    };
+
+    PreviewMode previewMode = PreviewMode::FastBilateral;
+    ExportMode exportMode = ExportMode::HQWavelet;
+    float strength = 0.35f;          // 0~1
+    float backgroundSigma = 3.0f;    // 仅对 median + N*sigma 以下区域生效
+    int   iterations = 1;            // 1~4
 };
 
 struct StackResult {
@@ -44,6 +63,8 @@ struct StackResult {
 class StackCore
 {
 public:
+    using ProgressCallback = std::function<void(float, const std::string&)>;
+
     StackCore();
     ~StackCore();
 
@@ -59,15 +80,17 @@ public:
     // 设置校准 / 拒绝策略
     void setCalibConfig(const CalibConfig& cfg)   { _calibCfg = cfg; }
     void setRejectConfig(const RejectConfig& cfg) { _rejCfg   = cfg; }
+    void setDenoiseConfig(const DenoiseConfig& cfg) { _denoiseCfg = cfg; }
 
     const CalibConfig&  calibConfig()  const { return _calibCfg;  }
     const RejectConfig& rejectConfig() const { return _rejCfg;   }
+    const DenoiseConfig& denoiseConfig() const { return _denoiseCfg; }
 
     // 预处理：生成 MasterBias / MasterDark / MasterFlat
     bool buildMasters();
 
     // 执行叠加：对所有 Light 做校准 + 叠加，返回结果
-    bool runStack(StackResult& outResult);
+    bool runStack(StackResult& outResult, const ProgressCallback& progressCallback = {});
 
     // 可以单独导出 master 帧（供诊断）
     const FitsImage* masterBias() const { return _masterBias.get(); }
@@ -88,6 +111,7 @@ private:
 
     CalibConfig  _calibCfg;
     RejectConfig _rejCfg;
+    DenoiseConfig _denoiseCfg;
 
     std::unique_ptr<FitsImage> _masterBias;
     std::unique_ptr<FitsImage> _masterDark;
@@ -106,6 +130,7 @@ private:
 
     bool calibrateLight(const FitsImage& inLight, FitsImage& outCalib);
     bool combineLights(const std::vector<FitsImage>& calibratedLights,
+                       const std::vector<double>& frameWeights,
                        FitsImage& outCombined);
 };
 

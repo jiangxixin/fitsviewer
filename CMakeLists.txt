@@ -56,6 +56,7 @@ endif()
 
 # ====================== 系统依赖：OpenGL / zlib ======================
 find_package(OpenGL REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 if(APPLE)
     # 如果你的 cfitsio 是带 zlib 的，必须连 zlib
@@ -84,6 +85,7 @@ set(GLAD_SOURCES
 include_directories(
         ${CMAKE_SOURCE_DIR}/include               # kty/FitsRenderer.h, StackCore.h
         ${CMAKE_SOURCE_DIR}/src/core             # ★ 确保能找到 FitsImage.h / Debayer.h / Stretch.h
+        ${CMAKE_SOURCE_DIR}/src/index
         ${CMAKE_SOURCE_DIR}/external             # stb_image_write.h
         ${CMAKE_SOURCE_DIR}/third_party_gl/include
         ${IMGUI_DIR}
@@ -98,6 +100,8 @@ add_library(kty_fits_core
         src/core/FitsRenderer.cpp
         src/core/GlImageRenderer.cpp
         src/core/FitsImage.cpp
+        src/index/FitsIndex.cpp
+        src/index/AppSessionStore.cpp
         src/core/Debayer.cpp
         src/core/Stretch.cpp
 )
@@ -105,6 +109,7 @@ add_library(kty_fits_core
 target_link_libraries(kty_fits_core
         PRIVATE
         ${CFITSIO_LIB}
+        SQLite::SQLite3
         OpenGL::GL
 )
 

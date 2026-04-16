@@ -57,6 +57,8 @@ bool GlImageRenderer::init()
         return false;
     if (!createStatsShader())
         return false;
+    if (!createDenoiseShader())
+        return false;
 
     glGenTextures(1, &_baseTexture);
     return true;
@@ -103,6 +105,17 @@ void GlImageRenderer::shutdown()
     {
         glDeleteFramebuffers(1, &_previewFBO);
         _previewFBO = 0;
+    }
+    _previewDisplayTex = 0;
+    if (_denoiseTex)
+    {
+        glDeleteTextures(1, &_denoiseTex);
+        _denoiseTex = 0;
+    }
+    if (_denoiseFBO)
+    {
+        glDeleteFramebuffers(1, &_denoiseFBO);
+        _denoiseFBO = 0;
     }
 
     destroyQuad();
@@ -635,6 +648,176 @@ void main()
     return true;
 }
 
+bool GlImageRenderer::createDenoiseShader()
+{
+    const char* vs_src = R"(#version 330 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec2 aUV;
+out vec2 vTexCoord;
+void main()
+{
+    vTexCoord = aUV;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)";
+
+    const char* fs_src = R"(#version 330 core
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+uniform sampler2D uSourceTex;
+uniform vec2 uInvTexSize;
+uniform float uStrength;
+uniform float uBgThreshold;
+uniform float uRangeSigma;
+
+float luminance(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main()
+{
+    vec3 center = texture(uSourceTex, vTexCoord).rgb;
+    float centerL = luminance(center);
+
+    float spatial[9] = float[9](
+        1.0, 2.0, 1.0,
+        2.0, 4.0, 2.0,
+        1.0, 2.0, 1.0
+    );
+
+    float rangeDenom = max(2.0 * uRangeSigma * uRangeSigma, 1e-5);
+    vec3 accum = vec3(0.0);
+    float wsum = 0.0;
+    int k = 0;
+    for (int y = -1; y <= 1; ++y)
+    {
+        for (int x = -1; x <= 1; ++x)
+        {
+            vec2 uv = vTexCoord + vec2(float(x), float(y)) * uInvTexSize;
+            vec3 s = texture(uSourceTex, uv).rgb;
+            float dl = luminance(s) - centerL;
+            float w = spatial[k] * exp(-(dl * dl) / rangeDenom);
+            accum += s * w;
+            wsum += w;
+            k++;
+        }
+    }
+
+    vec3 filtered = (wsum > 0.0) ? (accum / wsum) : center;
+    float backgroundness = clamp((uBgThreshold - centerL) / max(uBgThreshold, 1e-4), 0.0, 1.0);
+    float blend = uStrength * backgroundness * backgroundness;
+    vec3 outColor = mix(center, filtered, blend);
+    FragColor = vec4(outColor, 1.0);
+}
+)";
+
+    GLuint vs = compileShader(GL_VERTEX_SHADER, vs_src);
+    if (!vs) return false;
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fs_src);
+    if (!fs)
+    {
+        glDeleteShader(vs);
+        return false;
+    }
+
+    _denoiseProgram = linkProgram(vs, fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    if (!_denoiseProgram)
+        return false;
+
+    glUseProgram(_denoiseProgram);
+    _uDenoiseSourceTexLoc = glGetUniformLocation(_denoiseProgram, "uSourceTex");
+    _uDenoiseInvTexSizeLoc = glGetUniformLocation(_denoiseProgram, "uInvTexSize");
+    _uDenoiseStrengthLoc = glGetUniformLocation(_denoiseProgram, "uStrength");
+    _uDenoiseBgThresholdLoc = glGetUniformLocation(_denoiseProgram, "uBgThreshold");
+    _uDenoiseRangeSigmaLoc = glGetUniformLocation(_denoiseProgram, "uRangeSigma");
+    glUniform1i(_uDenoiseSourceTexLoc, 0);
+    glUseProgram(0);
+    return true;
+}
+
+bool GlImageRenderer::ensureDenoiseResources(int width, int height)
+{
+    if (!_denoiseFBO)
+        glGenFramebuffers(1, &_denoiseFBO);
+    if (!_denoiseTex)
+        glGenTextures(1, &_denoiseTex);
+
+    if (width != _denoiseW || height != _denoiseH)
+    {
+        _denoiseW = width;
+        _denoiseH = height;
+        glBindTexture(GL_TEXTURE_2D, _denoiseTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+
+    return _denoiseTex != 0 && _denoiseFBO != 0;
+}
+
+unsigned int GlImageRenderer::applyDenoisePass(unsigned int sourceTex, int width, int height)
+{
+    if (!_denoiseEnabled || !_denoiseProgram || sourceTex == 0 || width <= 0 || height <= 0)
+        return sourceTex;
+    if (_denoiseStrength <= 1e-4f || _denoiseIterations <= 0)
+        return sourceTex;
+    if (!ensureDenoiseResources(width, height))
+        return sourceTex;
+
+    GLuint currentRead = sourceTex;
+    GLuint currentWrite = _denoiseTex;
+
+    const float bgThreshold = std::clamp(0.08f + 0.06f * _denoiseBackgroundSigma, 0.08f, 0.50f);
+    const float rangeSigma = std::clamp(0.015f + 0.09f * _denoiseStrength, 0.015f, 0.12f);
+
+    GLint prevFBO = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
+    GLint prevViewport[4];
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+
+    glUseProgram(_denoiseProgram);
+    glUniform2f(_uDenoiseInvTexSizeLoc, 1.0f / std::max(width, 1), 1.0f / std::max(height, 1));
+    glUniform1f(_uDenoiseStrengthLoc, _denoiseStrength);
+    glUniform1f(_uDenoiseBgThresholdLoc, bgThreshold);
+    glUniform1f(_uDenoiseRangeSigmaLoc, rangeSigma);
+
+    for (int iter = 0; iter < _denoiseIterations; ++iter)
+    {
+        glBindFramebuffer(GL_FRAMEBUFFER, _denoiseFBO);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, currentWrite, 0);
+        GLenum drawBuf = GL_COLOR_ATTACHMENT0;
+        glDrawBuffers(1, &drawBuf);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            break;
+
+        glViewport(0, 0, width, height);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, currentRead);
+        glBindVertexArray(_quadVAO);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+        std::swap(currentRead, currentWrite);
+        if (currentWrite != sourceTex)
+            currentWrite = sourceTex;
+        else
+            currentWrite = _denoiseTex;
+    }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    return currentRead;
+}
+
 void GlImageRenderer::destroyQuad()
 {
     if (_quadVAO)
@@ -666,6 +849,11 @@ void GlImageRenderer::destroyShaders()
         glDeleteProgram(_statsProgram);
         _statsProgram = 0;
     }
+    if (_denoiseProgram)
+    {
+        glDeleteProgram(_denoiseProgram);
+        _denoiseProgram = 0;
+    }
 }
 
 void GlImageRenderer::uploadBaseTexture(const std::vector<float>& bayerOrGray, int width, int height)
@@ -673,15 +861,19 @@ void GlImageRenderer::uploadBaseTexture(const std::vector<float>& bayerOrGray, i
     if (bayerOrGray.empty() || width <= 0 || height <= 0 || !_baseTexture)
     {
         _hasTexture = false;
+        _previewDisplayTex = 0;
         return;
     }
 
     _imgWidth  = width;
     _imgHeight = height;
+    _previewDisplayTex = 0;
 
     glBindTexture(GL_TEXTURE_2D, _baseTexture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     // 归一化 float → 单通道 RED（float）
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, width, height,
@@ -702,9 +894,21 @@ void GlImageRenderer::setWhiteBalance(float r, float g, float b)
     _wbB = b;
 }
 
-bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
+void GlImageRenderer::setLinearDenoiseConfig(bool enabled,
+                                             float strength,
+                                             float backgroundSigma,
+                                             int iterations)
+{
+    _denoiseEnabled = enabled;
+    _denoiseStrength = std::clamp(strength, 0.0f, 1.0f);
+    _denoiseBackgroundSigma = std::max(backgroundSigma, 0.5f);
+    _denoiseIterations = std::clamp(iterations, 1, 4);
+}
+
+bool GlImageRenderer::computeWhiteBalanceGpuImpl(float& outGainR,
                                                  float& outGainG,
-                                                 float& outGainB)
+                                                 float& outGainB,
+                                                 bool backgroundNeutralization)
 {
     if (!_hasTexture || !_shaderProgram || !_quadVAO)
         return false;
@@ -720,6 +924,7 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
     float oldZoom      = _zoom;
     float oldPanX      = _panX;
     float oldPanY      = _panY;
+    bool  oldDenoiseEnabled = _denoiseEnabled;
 
     auto restorePreviewState = [&]() {
         _zoom = oldZoom;
@@ -735,6 +940,7 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
         _autoLow = oldLow;
         _autoHigh = oldHigh;
         _stretchStrength = oldStrength;
+        _denoiseEnabled = oldDenoiseEnabled;
         restorePreviewState();
         setWhiteBalance(_wbR, _wbG, _wbB);
         setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
@@ -748,6 +954,7 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
     _zoom = 1.0f;
     _panX = 0.0f;
     _panY = 0.0f;
+    _denoiseEnabled = false;
     setWhiteBalance(_wbR, _wbG, _wbB);
     setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
 
@@ -779,11 +986,19 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
 
     glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
 
-    // ==== 3. 在 CPU 上对这张 debayer 后的小图做 Grey-World + 亮度过滤 ====
-    double sumR = 0.0;
-    double sumG = 0.0;
-    double sumB = 0.0;
-    size_t count = 0;
+    // ==== 3. 在 CPU 上对这张 debayer 后的小图做稳健白平衡估计 ====
+    struct Sample
+    {
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        float l = 0.0f;
+    };
+
+    std::vector<Sample> samples;
+    samples.reserve((size_t)S * S);
+    std::vector<float> luminanceValues;
+    luminanceValues.reserve((size_t)S * S);
 
     for (int y = 0; y < S; ++y)
     {
@@ -793,17 +1008,115 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
             float r = pixels[idx + 0];
             float g = pixels[idx + 1];
             float b = pixels[idx + 2];
-
-            // 亮度（注意这是线性 debayer 后的亮度）
             float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
-            // 过滤掉太暗/太亮，避免噪声和饱和星点；这就是 "天文友好" 的第一步
-            if (l < 0.10f || l > 0.90f)
+            if (l <= 1e-5f)
                 continue;
 
-            sumR += r;
-            sumG += g;
-            sumB += b;
+            samples.push_back({r, g, b, l});
+            luminanceValues.push_back(l);
+        }
+    }
+
+    if (samples.empty())
+    {
+        restoreAllState();
+        return false;
+    }
+
+    std::sort(luminanceValues.begin(), luminanceValues.end());
+    auto percentile = [&](float p) -> float
+    {
+        if (luminanceValues.empty())
+            return 0.0f;
+        p = std::clamp(p, 0.0f, 1.0f);
+        const size_t idx = static_cast<size_t>(p * (luminanceValues.size() - 1));
+        return luminanceValues[idx];
+    };
+
+    const float lumLow = percentile(0.10f);
+    const float lumHigh = percentile(0.98f);
+    const float bgLow = percentile(0.05f);
+    const float bgHigh = percentile(0.45f);
+
+    auto accumulate_neutral = [](const std::vector<Sample>& src,
+                                 float low,
+                                 float high,
+                                 bool backgroundMode,
+                                 double& sumR,
+                                 double& sumG,
+                                 double& sumB,
+                                 size_t& count)
+    {
+        sumR = 0.0;
+        sumG = 0.0;
+        sumB = 0.0;
+        count = 0;
+
+        for (const Sample& s : src)
+        {
+            if (s.l < low || s.l > high)
+                continue;
+
+            const float maxc = std::max({s.r, s.g, s.b});
+            const float minc = std::min({s.r, s.g, s.b});
+            if (maxc <= 1e-6f)
+                continue;
+
+            const float saturation = (maxc - minc) / maxc;
+            const float satLimit = backgroundMode
+                                 ? (0.10f + 0.10f * std::clamp(s.l, 0.0f, 1.0f))
+                                 : (0.20f + 0.25f * std::clamp(s.l, 0.0f, 1.0f));
+            if (saturation > satLimit)
+                continue;
+
+            float weight = 1.0f - 0.7f * saturation;
+            if (backgroundMode)
+            {
+                // 背景中性化更偏向暗部、低饱和区域，避免星点和主体颜色主导增益。
+                const float normalizedL = std::clamp((s.l - low) / std::max(high - low, 1e-4f), 0.0f, 1.0f);
+                weight *= (1.20f - 0.70f * normalizedL);
+            }
+            sumR += s.r * weight;
+            sumG += s.g * weight;
+            sumB += s.b * weight;
+            if (weight > 1e-5f)
+                ++count;
+        }
+    };
+
+    double sumR = 0.0;
+    double sumG = 0.0;
+    double sumB = 0.0;
+    size_t count = 0;
+    if (backgroundNeutralization)
+        accumulate_neutral(samples, bgLow, bgHigh, true, sumR, sumG, sumB, count);
+    else
+        accumulate_neutral(samples, lumLow, lumHigh, false, sumR, sumG, sumB, count);
+
+    if (count < 128)
+    {
+        // 回退：放宽条件，避免在窄带或极暗画面上完全失效。
+        sumR = 0.0;
+        sumG = 0.0;
+        sumB = 0.0;
+        count = 0;
+        for (const Sample& s : samples)
+        {
+            const float low = backgroundNeutralization ? percentile(0.02f) : percentile(0.03f);
+            const float high = backgroundNeutralization ? percentile(0.70f) : percentile(0.995f);
+            if (s.l < low || s.l > high)
+                continue;
+            const float maxc = std::max({s.r, s.g, s.b});
+            const float minc = std::min({s.r, s.g, s.b});
+            if (maxc <= 1e-6f)
+                continue;
+            const float saturation = (maxc - minc) / maxc;
+            if (backgroundNeutralization && saturation > 0.22f)
+                continue;
+            sumR += s.r;
+            sumG += s.g;
+            sumB += s.b;
             ++count;
         }
     }
@@ -814,9 +1127,9 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
         return false;
     }
 
-    double meanR = sumR / (double)count;
-    double meanG = sumG / (double)count;
-    double meanB = sumB / (double)count;
+    double meanR = sumR / static_cast<double>(count);
+    double meanG = sumG / static_cast<double>(count);
+    double meanB = sumB / static_cast<double>(count);
 
     if (meanR <= 0.0 || meanG <= 0.0 || meanB <= 0.0)
     {
@@ -826,13 +1139,21 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
 
     double meanGrey = (meanR + meanG + meanB) / 3.0;
 
-    float gR = (float)(meanGrey / meanR);
-    float gG = (float)(meanGrey / meanG);
-    float gB = (float)(meanGrey / meanB);
+    float gR = static_cast<float>(meanGrey / meanR);
+    float gG = static_cast<float>(meanGrey / meanG);
+    float gB = static_cast<float>(meanGrey / meanB);
 
-    auto clampGain = [](float g) {
-        if (g < 0.25f) g = 0.25f;
-        if (g > 4.0f)  g = 4.0f;
+    auto clampGain = [backgroundNeutralization](float g) {
+        if (backgroundNeutralization)
+        {
+            if (g < 0.55f) g = 0.55f;
+            if (g > 1.80f) g = 1.80f;
+        }
+        else
+        {
+            if (g < 0.4f) g = 0.4f;
+            if (g > 2.5f) g = 2.5f;
+        }
         return g;
     };
 
@@ -851,12 +1172,27 @@ bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
     _autoLow         = oldLow;
     _autoHigh        = oldHigh;
     _stretchStrength = oldStrength;
+    _denoiseEnabled  = oldDenoiseEnabled;
     setAutoParams(_useAuto, _autoLow, _autoHigh, _stretchStrength);
 
     outGainR = gR;
     outGainG = gG;
     outGainB = gB;
     return true;
+}
+
+bool GlImageRenderer::computeAutoWhiteBalanceGpu(float& outGainR,
+                                                 float& outGainG,
+                                                 float& outGainB)
+{
+    return computeWhiteBalanceGpuImpl(outGainR, outGainG, outGainB, false);
+}
+
+bool GlImageRenderer::computeBackgroundNeutralizationGpu(float& outGainR,
+                                                         float& outGainG,
+                                                         float& outGainB)
+{
+    return computeWhiteBalanceGpuImpl(outGainR, outGainG, outGainB, true);
 }
 
 void GlImageRenderer::setStretchMode(int mode)
@@ -933,13 +1269,6 @@ bool GlImageRenderer::computeAutoParamsGpu(bool useAuto,
         return false;
     }
 
-    if (!useAuto)
-    {
-        outLow  = 0.0f;
-        outHigh = 1.0f;
-        return true;
-    }
-
     GLint prevFBO = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
     GLint prevViewport[4];
@@ -998,8 +1327,8 @@ bool GlImageRenderer::computeAutoParamsGpu(bool useAuto,
     blackClip = clampPercent(blackClip);
     whiteClip = clampPercent(whiteClip);
 
-    float pLow  = blackClip / 100.0f;
-    float pHigh = (100.0f - whiteClip) / 100.0f;
+    float pLow  = useAuto ? (blackClip / 100.0f) : 0.0f;
+    float pHigh = useAuto ? ((100.0f - whiteClip) / 100.0f) : 1.0f;
 
     size_t idxLow  = (size_t)(pLow  * (n - 1));
     size_t idxHigh = (size_t)(pHigh * (n - 1));
@@ -1091,10 +1420,12 @@ bool GlImageRenderer::renderToImage(int width, int height, std::vector<unsigned 
         glGenTextures(1, &_exportTex);
 
     glBindTexture(GL_TEXTURE_2D, _exportTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height,
                  0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     GLint prevFBO = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
@@ -1128,6 +1459,14 @@ bool GlImageRenderer::renderToImage(int width, int height, std::vector<unsigned 
     glBindVertexArray(_quadVAO);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     glBindVertexArray(0);
+
+    GLuint exportReadTex = applyDenoisePass(_exportTex, width, height);
+    if (exportReadTex != 0 && exportReadTex != _exportTex)
+    {
+        glBindFramebuffer(GL_FRAMEBUFFER, _exportFBO);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, exportReadTex, 0);
+    }
 
     outRGB.resize((size_t)width * height * 3);
     glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, outRGB.data());
@@ -1167,10 +1506,12 @@ bool GlImageRenderer::renderPreview(int width, int height)
         _previewH = height;
 
         glBindTexture(GL_TEXTURE_2D, _previewTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, _previewW, _previewH,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, _previewW, _previewH,
                      0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
     GLint prevFBO = 0;
@@ -1206,9 +1547,47 @@ bool GlImageRenderer::renderPreview(int width, int height)
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     glBindVertexArray(0);
 
+    _previewDisplayTex = _previewTex;
+    GLuint denoisedPreviewTex = applyDenoisePass(_previewTex, _previewW, _previewH);
+    if (denoisedPreviewTex != 0)
+        _previewDisplayTex = denoisedPreviewTex;
+
     glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
     glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
     glUseProgram(0);
 
+    return true;
+}
+
+bool GlImageRenderer::uploadPreviewRgb(const std::vector<unsigned char>& rgb, int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return false;
+    if (rgb.size() != static_cast<size_t>(width) * static_cast<size_t>(height) * 3)
+        return false;
+
+    if (!_previewTex)
+        glGenTextures(1, &_previewTex);
+
+    if (width != _previewW || height != _previewH)
+    {
+        _previewW = width;
+        _previewH = height;
+        glBindTexture(GL_TEXTURE_2D, _previewTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, _previewW, _previewH,
+                     0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    else
+    {
+        glBindTexture(GL_TEXTURE_2D, _previewTex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, _previewW, _previewH,
+                        GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+    }
+
+    _previewDisplayTex = _previewTex;
     return true;
 }

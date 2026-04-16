@@ -49,11 +49,17 @@ public:
     void shutdown();
 
     bool loadFits(const std::string& path, BayerPattern bayerHint);
+    bool loadMonochromeImage(const std::vector<double>& raw,
+                             int width,
+                             int height,
+                             BayerPattern bayerHint);
 
     void setStretchParams(const StretchParams& p);
     void setWhiteBalance(const WhiteBalance& wb);
     void setViewParams(const ViewParams& vp);
     void setBayerPattern(BayerPattern bayer);
+    void setLinearDenoiseConfig(bool enabled, float strength, float backgroundSigma, int iterations);
+    void setExportDenoiseConfig(int mode, float strength, float backgroundSigma, int iterations);
 
     const StretchParams& stretchParams() const { return _stretch; }
     const WhiteBalance&  whiteBalance() const { return _wb; }
@@ -73,12 +79,16 @@ public:
 
     // 计算自动白平衡（更新内部 _wb 并同步到 GL），true=成功
     bool computeAutoWhiteBalance();
+    bool computeBackgroundNeutralization();
 
     bool hasImage() const { return _hasImage; }
     int  width()   const { return _imgWidth; }
     int  height()  const { return _imgHeight; }
 
 private:
+    void invalidateHqCaches();
+    bool ensureHqLinearCache() const;
+
     bool  _hasImage = false;
     int   _imgWidth = 0;
     int   _imgHeight = 0;
@@ -90,6 +100,28 @@ private:
 
     float _autoLow  = 0.0f;
     float _autoHigh = 1.0f;
+    int   _exportDenoiseMode = 1;
+    float _exportDenoiseStrength = 0.35f;
+    float _exportBackgroundSigma = 3.0f;
+    int   _exportDenoiseIterations = 1;
+
+    mutable bool _hqLinearCacheValid = false;
+    mutable int _hqLinearCacheW = 0;
+    mutable int _hqLinearCacheH = 0;
+    mutable std::vector<float> _hqLinearRgbCache;
+    mutable bool _hqLinearLowResCacheValid = false;
+    mutable int _hqLinearLowResCacheW = 0;
+    mutable int _hqLinearLowResCacheH = 0;
+    mutable std::vector<float> _hqLinearLowResRgbCache;
+
+    mutable bool _hqPreviewCacheValid = false;
+    mutable int _hqPreviewCacheW = 0;
+    mutable int _hqPreviewCacheH = 0;
+    mutable bool _hqPreviewNeedsHighRes = false;
+    mutable StretchParams _hqPreviewStretch;
+    mutable ViewParams _hqPreviewView;
+    mutable float _hqPreviewAutoLow = 0.0f;
+    mutable float _hqPreviewAutoHigh = 1.0f;
 
     void* _fits = nullptr;   // FitsImage*
     void* _gl   = nullptr;   // GlImageRenderer*

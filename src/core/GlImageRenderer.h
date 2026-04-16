@@ -19,6 +19,7 @@ public:
 
     // 白平衡
     void setWhiteBalance(float r, float g, float b);
+    void setLinearDenoiseConfig(bool enabled, float strength, float backgroundSigma, int iterations);
 
     // 0: Linear, 1: Asinh, 2: Log, 3: Sqrt
     void setStretchMode(int mode);
@@ -41,15 +42,17 @@ public:
 
     // 使用 GPU debayer + 小预览纹理做自动白平衡
     bool computeAutoWhiteBalanceGpu(float& outGainR, float& outGainG, float& outGainB);
+    bool computeBackgroundNeutralizationGpu(float& outGainR, float& outGainG, float& outGainB);
 
     // 全分辨率渲染到离屏 FBO 并读回 RGB8（用于导出 PNG）
     bool renderToImage(int width, int height, std::vector<unsigned char>& outRGB);
 
     // 预览渲染：在内部 FBO 生成预览纹理（Image 面板用）
     bool renderPreview(int width, int height);
+    bool uploadPreviewRgb(const std::vector<unsigned char>& rgb, int width, int height);
 
     // 预览纹理 ID（OpenGL 纹理句柄）
-    unsigned int previewTextureId() const { return _previewTex; }
+    unsigned int previewTextureId() const { return _previewDisplayTex; }
 
     // 获取亮度直方图（已经归一化到 0~1）
     bool getLuminanceHistogram(std::vector<float>& outHist) const;
@@ -65,6 +68,7 @@ private:
     unsigned int _quadVBO       = 0;
     unsigned int _quadEBO       = 0;
     unsigned int _shaderProgram = 0;
+    unsigned int _denoiseProgram = 0;
 
     // 主 shader uniform
     int _uBaseTexLoc         = -1;
@@ -101,8 +105,20 @@ private:
     // 预览 FBO + 纹理（ImGui::Image 用）
     unsigned int _previewFBO = 0;
     unsigned int _previewTex = 0;
+    unsigned int _previewDisplayTex = 0;
     int          _previewW   = 0;
     int          _previewH   = 0;
+
+    // GPU 降噪临时 FBO + 纹理
+    unsigned int _denoiseFBO = 0;
+    unsigned int _denoiseTex = 0;
+    int          _denoiseW   = 0;
+    int          _denoiseH   = 0;
+    int _uDenoiseSourceTexLoc = -1;
+    int _uDenoiseInvTexSizeLoc = -1;
+    int _uDenoiseStrengthLoc = -1;
+    int _uDenoiseBgThresholdLoc = -1;
+    int _uDenoiseRangeSigmaLoc = -1;
 
     // 图像尺寸
     int  _imgWidth  = 0;
@@ -129,6 +145,10 @@ private:
     float _wbR             = 1.0f;
     float _wbG             = 1.0f;
     float _wbB             = 1.0f;
+    bool  _denoiseEnabled  = false;
+    float _denoiseStrength = 0.35f;
+    float _denoiseBackgroundSigma = 3.0f;
+    int   _denoiseIterations = 1;
 
     int   _bayerPattern    = 1;    // 默认 RGGB
 
@@ -140,7 +160,14 @@ private:
     bool createQuad();
     bool createMainShader();
     bool createStatsShader();
+    bool createDenoiseShader();
     void destroyQuad();
     void destroyShaders();
     void updateUniforms(int viewportWidth, int viewportHeight);
+    bool computeWhiteBalanceGpuImpl(float& outGainR,
+                                    float& outGainG,
+                                    float& outGainB,
+                                    bool backgroundNeutralization);
+    bool ensureDenoiseResources(int width, int height);
+    unsigned int applyDenoisePass(unsigned int sourceTex, int width, int height);
 };

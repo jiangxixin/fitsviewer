@@ -1,9 +1,13 @@
 #pragma once
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kty/FitsRenderer.h"
 #include "kty/StackCore.h"
+#include "AppSessionStore.h"
+#include "FitsIndex.h"
 #include <imgui.h>
 
 struct GLFWwindow;
@@ -38,14 +42,54 @@ private:
 
     // Folder mode: scan current folder for FITS files
     void refreshDirFits();
+    void clearCurrentFitsSelection();
+    bool setCurrentFitsPath(const std::string& path);
 
     // Load FITS at current index in _dirFits
     bool loadDirFitsCurrent();
 
     // Browse FITS in folder (delta = -1 / +1)
     void browseDirFits(int delta);
+    void refreshSearchResults();
+    void syncRendererLinearDenoise();
+    void refreshRendererHistogram();
+    void resetControlParams();
+    void resetStackParams();
+    void indexCurrentFolder();
+    void loadSearchResult(int index);
+    bool addStackFile(const std::string& path, kty::FrameType type);
+    void addSelectedSearchResultsToStack(kty::FrameType type);
+    int selectedSearchResultCount() const;
+    bool saveSessionState();
+    void loadSessionState();
+    void startIndexJob();
+    void startStackJob();
+    void pollBackgroundJobs();
 
 private:
+    struct IndexJobState {
+        std::thread worker;
+        std::mutex mutex;
+        bool running = false;
+        bool finished = false;
+        bool success = false;
+        float progress = 0.0f;
+        std::string message;
+        std::string log;
+    };
+
+    struct StackJobState {
+        std::thread worker;
+        std::mutex mutex;
+        bool running = false;
+        bool finished = false;
+        bool success = false;
+        float progress = 0.0f;
+        std::string message;
+        std::string log;
+        kty::StackResult result;
+    };
+
     GLFWwindow* _window = nullptr;
 
     kty::FitsRenderer _renderer;
@@ -60,6 +104,10 @@ private:
     // FITS files in current directory (full paths)
     std::vector<std::string> _dirFits;
     int  _dirFitsIndex = -1;
+    std::string _searchQuery;
+    std::vector<kty::FitsSearchResult> _searchResults;
+    std::vector<bool> _searchResultChecked;
+    int _searchSelectedIndex = -1;
 
     // File dialog internal state
     std::string _fileDialogDir;
@@ -69,6 +117,7 @@ private:
     int  _selectedFileIndex  = -1;
 
     bool  _hasImage = false;
+    bool  _showingStackResult = false;
 
     kty::BayerPattern  _bayer      = kty::BayerPattern::RGGB;
     kty::StretchParams _stretch;
@@ -79,6 +128,11 @@ private:
 
     bool        _exportJustSucceeded = false;
     std::string _lastExportPath;
+
+    kty::FitsIndexDb _fitsIndex;
+    kty::AppSessionStore _sessionStore;
+    std::string _indexDbPath;
+    std::string _indexStatus;
 
     // ===== StackCore UI state =====
     struct StackFileItem {
@@ -94,4 +148,6 @@ private:
     int         _stackBiasCount  = 0;
 
     std::string _stackLog;
+    IndexJobState _indexJob;
+    StackJobState _stackJob;
 };
